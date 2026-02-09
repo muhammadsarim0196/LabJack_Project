@@ -1,0 +1,31 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "cppbuild",
+            "label": "Build LabJack Code",
+            "command": "cl.exe",
+            "args": [
+                "/Zi",
+                "/EHsc",
+                "/nologo",
+                "${file}",
+                "/Fe:",
+                "${fileDirname}\\${fileBasenameNoExtension}.exe",
+                "/I", "C:\\Program Files (x86)\\LabJack\\Drivers",
+                "/link",
+                "/LIBPATH:C:\\Program Files (x86)\\LabJack\\Drivers\\64bit",
+                "LabJackM.lib"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": ["$msCompile"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Compiler for LabJack T-Series"
+        }
+    ]
+}
