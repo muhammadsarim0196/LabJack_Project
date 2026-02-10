@@ -56,7 +56,7 @@ void RunWebServer() {
                     body { font-family: sans-serif; text-align: center; padding: 50px; background-color: #222; color: white; }
                     input { padding: 10px; font-size: 20px; width: 100px; text-align: center;}
                     button { padding: 10px 20px; font-size: 20px; cursor: pointer; background-color: #00CC00; border: none; font-weight: bold;}
-                    h1 { color: #00CC00; }
+                    h1 { color: #10ff10; }
                 </style>
             </head>
             <body>
