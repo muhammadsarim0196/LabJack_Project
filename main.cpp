@@ -1,138 +1,84 @@
 /**
- * LABJACK CONTROL SYSTEM + WEB CONTROLLER (ROBUST STRING FIX)
- * ---------------------------------------
- * Hardware: LabJack T7 (Mux80) + DSD Tech RS485 Relay
- * Software: InfluxDB Logger + Web Control Panel
+ * SMART HYDRAULIC CONTROL SYSTEM (FINAL)
+ * --------------------------------------
+ * - Logic: Auto-Recirc -> Post -> Idle
+ * - Physics: m*Cp*dT Calculation Display & Config
+ * - Hardware: DSD Tech / Modbus RTU Compatible
  */
 
-// 1. NETWORK HEADERS MUST BE FIRST
-#define WIN32_LEAN_AND_MEAN 
-#include <winsock2.h> 
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
 #include <windows.h>
-
 #include <iostream>
 #include <vector>
 #include <string>
-#include <atomic> 
-#include <LabJackM.h>
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
+#include <cmath>
+#include <mutex>
 #include "httplib.h"
 
 using namespace std;
 
-// --- SHARED VARIABLES ---
-atomic<double> GLOBAL_TARGET_TEMP(30.0); 
+// --- CONFIGURATION CONSTANTS ---
+const double WATER_CP = 4186.0; // J/(kg*C)
 
-// --- CONFIGURATION ---
-const char* INFLUX_HOST = "localhost";
-const int   INFLUX_PORT = 8086;
-const char* INFLUX_ORG  = "AQL";               
-const char* INFLUX_BUCKET = "AQL_Bucket";      
-const char* INFLUX_TOKEN = "6QfQ73FZc9Yw_BsfB1rX1dM2PQXivn_Hwd6jTMEBVunAlugvqo7u6Z5qjLa_rCokFdUOTuufOxQxeLVUhiAPeg=="; 
+// --- GLOBAL SHARED STATE ---
+struct SystemState {
+    // Simulated Sensors
+    atomic<double> t1{20.0}; // Inlet
+    atomic<double> t2{25.0}; // Tank Low
+    atomic<double> t3{55.0}; // Tank High
+    atomic<double> t4{25.0}; // Outlet
 
-// --- HELPER FUNCTION ---
-void ErrorCheck(int err, const char *msg) { 
-    if(err < 0) { 
-        char errName[LJM_MAX_NAME_SIZE];
-        LJM_ErrorToString(err, errName);
-        printf("Error: %s (%s)\n", msg, errName); 
-    } 
-}
+    // User Configuration
+    atomic<double> targetWarm{40.0};
+    atomic<double> targetHot{90.0};
+    atomic<double> massFlowRateL_min{1.0};   // RESTORED
+    atomic<double> heaterMaxPowerW{3000.0};  // RESTORED
+    atomic<int>    preTimeSec{5};
+    atomic<int>    postTimeSec{5};
 
-// --- WEB SERVER THREAD ---
-void RunWebServer() {
-    httplib::Server svr;
+    // Recirculation Config
+    atomic<double> tankTargetTemp{65.0}; 
+    atomic<double> tankMaxDelta{2.0};    
 
-    // 1. HOST THE WEBPAGE
-    // FIX: Using R"HTML( ... )HTML" to prevent parsing errors
-    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
-        string html = R"HTML(
-            <html>
-            <head>
-                <style>
-                    body { font-family: sans-serif; text-align: center; padding: 50px; background-color: #222; color: white; }
-                    input { padding: 10px; font-size: 20px; width: 100px; text-align: center;}
-                    button { padding: 10px 20px; font-size: 20px; cursor: pointer; background-color: #00CC00; border: none; font-weight: bold;}
-                    h1 { color: #10ff10; }
-                </style>
-            </head>
-            <body>
-                <h1>Heater Control Panel</h1>
-                <p>Current Target Temperature:</p>
-                <h2 id="disp">Loading...</h2>
-                <br>
-                <input type="number" id="newTemp" placeholder="30">
-                <button onclick="setTemp()">Set Temp</button>
+    // System Status
+    atomic<double> calculatedPower{0.0};
+    atomic<double> heaterDutyCycle{0.0};
+    string currentMode = "AUTO";         
+    string currentStage = "IDLE";        
+    string statusMessage = "System Starting...";
 
-                <script>
-                    function setTemp() {
-                        var val = document.getElementById('newTemp').value;
-                        fetch("/set?val=" + val).then(() => {
-                            alert("Target updated to " + val + "C");
-                            updateDisplay();
-                        });
-                    }
-                    
-                    function updateDisplay() {
-                        fetch("/status").then(r => r.text()).then(t => {
-                            document.getElementById("disp").innerText = t + " C";
-                        });
-                    }
-                    setInterval(updateDisplay, 1000); 
-                </script>
-            </body>
-            </html>
-        )HTML"; // <--- CLOSING DELIMITER MUST MATCH OPENING
-        
-        res.set_content(html, "text/html");
-    });
+    // Relay States
+    bool ev[7] = {0}; 
+    bool pump = false;
+    bool heater = false;
 
-    // 2. RECEIVE COMMANDS
-    svr.Get("/set", [](const httplib::Request& req, httplib::Response& res) {
-        if (req.has_param("val")) {
-            string val = req.get_param_value("val");
-            try {
-                GLOBAL_TARGET_TEMP = stod(val); 
-                cout << "\n[WEB CMD] New Target Set: " << val << " C" << endl;
-            } catch(...) {
-                cout << "\n[WEB CMD] Invalid Number Received" << endl;
-            }
-        }
-        res.set_content("OK", "text/plain");
-    });
+    // Control Flags
+    atomic<bool> isPouring{false}; 
+    mutex stateMutex;
+};
 
-    // 3. SEND STATUS
-    svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
-        stringstream ss;
-        ss << GLOBAL_TARGET_TEMP;
-        res.set_content(ss.str(), "text/plain");
-    });
+SystemState SYS;
 
-    cout << "Web Controller running at http://localhost:8090" << endl;
-    svr.listen("0.0.0.0", 8090);
-}
-
-// --- SERIAL PORT CLASS ---
+// --- SERIAL PORT ---
 class SerialPort {
     HANDLE hSerial;
 public:
     bool connected;
-    SerialPort(string portName, int baudRate) {
-        connected = false;
-        string fullPortName = "\\\\.\\" + portName; 
+    SerialPort(string portName) {
+        string fullPortName = "\\\\.\\" + portName;
         hSerial = CreateFileA(fullPortName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
-        if (hSerial == INVALID_HANDLE_VALUE) return;
-        DCB dcb = { 0 }; dcb.DCBlength = sizeof(dcb); GetCommState(hSerial, &dcb);
-        dcb.BaudRate = baudRate; dcb.ByteSize = 8; dcb.StopBits = ONESTOPBIT; dcb.Parity = NOPARITY;
-        SetCommState(hSerial, &dcb);
-        
-        COMMTIMEOUTS timeouts = { 0 };
-        timeouts.WriteTotalTimeoutConstant = 50;
-        SetCommTimeouts(hSerial, &timeouts);
-        connected = true;
+        connected = (hSerial != INVALID_HANDLE_VALUE);
+        if(connected) {
+             DCB dcb = {0}; dcb.DCBlength = sizeof(dcb); GetCommState(hSerial, &dcb);
+             dcb.BaudRate = 9600; dcb.ByteSize = 8; dcb.StopBits = ONESTOPBIT; dcb.Parity = NOPARITY;
+             SetCommState(hSerial, &dcb);
+        }
     }
     void write(const vector<unsigned char>& data) {
         if (!connected) return;
@@ -141,93 +87,368 @@ public:
     ~SerialPort() { if(connected) CloseHandle(hSerial); }
 };
 
-class RelayBoard {
+// --- RELAY CONTROLLER (DSD TECH) ---
+class RelayController {
     SerialPort* serial;
+    bool lastState[9] = {false}; 
+    bool firstRun = true;
+
     unsigned short crc16(const vector<unsigned char>& data) {
         unsigned short crc = 0xFFFF;
         for (size_t i = 0; i < data.size(); i++) {
             crc ^= data[i];
-            for (int j = 0; j < 8; j++) { if (crc & 0x0001) { crc >>= 1; crc ^= 0xA001; } else { crc >>= 1; } }
-        } return crc;
+            for (int j = 0; j < 8; j++) {
+                if (crc & 0x0001) { crc >>= 1; crc ^= 0xA001; } else { crc >>= 1; }
+            }
+        }
+        return crc;
     }
-public:
-    RelayBoard(SerialPort* sp) : serial(sp) {}
-    void setRelay(int relayIndex, bool state) {
-        vector<unsigned char> cmd = {0x01, 0x06, 0x00, (unsigned char)relayIndex, (unsigned char)(state?1:2), 0x00};
+
+    void sendSingleRelay(int relayIndex, bool state) {
+        // [ID] [06] [AddressHi] [AddressLo] [ValHi] [ValLo] [CRC]
+        unsigned char val = state ? 0x01 : 0x02; 
+        
+        vector<unsigned char> cmd = {0x01, 0x06, 0x00, (unsigned char)relayIndex, val, 0x00};
         unsigned short crc = crc16(cmd);
-        cmd.push_back(crc & 0xFF); cmd.push_back((crc >> 8) & 0xFF);
+        cmd.push_back(crc & 0xFF);
+        cmd.push_back((crc >> 8) & 0xFF);
         serial->write(cmd);
+        Sleep(20); 
     }
-};
 
-class DashboardLogger {
-    httplib::Client cli;
-    string tokenHeader;
 public:
-    DashboardLogger() : cli(INFLUX_HOST, INFLUX_PORT) {
-        tokenHeader = "Token "; tokenHeader += INFLUX_TOKEN;
-        cli.set_connection_timeout(1);
-    }
-    void log(double tc1, double tc2, double setpoint, bool heaterState) {
-        stringstream ss; ss << fixed << setprecision(2);
-        ss << "thermal_system,unit=labjack tc1=" << tc1 << ",tc2=" << tc2 
-           << ",setpoint=" << setpoint << ",heater_state=" << (heaterState ? 1 : 0);
-        string path = "/api/v2/write?org="; path += INFLUX_ORG; path += "&bucket="; path += INFLUX_BUCKET; path += "&precision=s";
-        httplib::Headers headers = { {"Authorization", tokenHeader}, {"Content-Type", "text/plain"} };
-        auto res = cli.Post(path.c_str(), headers, ss.str(), "text/plain");
-    }
-};
+    RelayController(SerialPort* sp) : serial(sp) {}
 
-int main() {
-    // 1. START WEB SERVER
-    thread webThread(RunWebServer);
-    webThread.detach(); 
-
-    // 2. SETUP HARDWARE
-    SerialPort relaySerial("COM9", 9600); 
-    if (!relaySerial.connected) { cout << "Relay COM Error" << endl; return 1; }
-    RelayBoard relays(&relaySerial);
-    DashboardLogger logger; 
-
-    int handle; int err; int errorAddress = -1;
-    err = LJM_Open(LJM_dtT7, LJM_ctANY, "ANY", &handle);
-    ErrorCheck(err, "LJM_Open");
-    
-    // Mux80 Setup
-    const char *names[] = {"AIN48_NEGATIVE_CH", "AIN48_EF_INDEX", "AIN48_EF_CONFIG_A", "AIN48_EF_CONFIG_B",
-                           "AIN49_NEGATIVE_CH", "AIN49_EF_INDEX", "AIN49_EF_CONFIG_A", "AIN49_EF_CONFIG_B"};
-    double values[] = {56, 24, 1, 60052,  57, 24, 1, 60052};
-    LJM_eWriteNames(handle, 8, names, values, &errorAddress);
-
-    const char *readNames[] = {"AIN48_EF_READ_A", "AIN49_EF_READ_A"};
-    double readValues[2];
-
-    cout << "Hardware Ready. Go to http://localhost:8090 to control temperature." << endl;
-
-    // 3. MAIN LOOP
-    while (true) {
-        err = LJM_eReadNames(handle, 2, readNames, readValues, &errorAddress);
-        double t1 = (err == 0) ? readValues[0] : -9999;
-        double t2 = (err == 0) ? readValues[1] : -9999;
-
-        double currentTarget = GLOBAL_TARGET_TEMP; 
-
-        bool heaterState = false;
-        if (t1 < currentTarget && t1 > -100.0) { 
-            relays.setRelay(1, true); 
-            heaterState = true;
-        } else {
-            relays.setRelay(1, false);
-            heaterState = false;
+    void setRelays(bool ev1, bool ev2, bool ev3, bool ev4, bool ev5, bool ev6, bool pump, bool heater) {
+        {
+            lock_guard<mutex> lock(SYS.stateMutex);
+            SYS.ev[1] = ev1; SYS.ev[2] = ev2; SYS.ev[3] = ev3;
+            SYS.ev[4] = ev4; SYS.ev[5] = ev5; SYS.ev[6] = ev6;
+            SYS.pump = pump; SYS.heater = heater;
         }
 
-        printf("Target: %.1f C | TC1: %.2f C | TC2: %.2f C | Heater: %s   \r", 
-               currentTarget, t1, t2, heaterState ? "ON " : "OFF");
-        
-        logger.log(t1, t2, currentTarget, heaterState);
-        Sleep(1000); 
-    }
+        bool desired[9] = {false, ev1, ev2, ev3, ev4, ev5, ev6, pump, heater};
 
-    LJM_Close(handle);
+        for (int i = 1; i <= 8; i++) {
+            if (firstRun || (desired[i] != lastState[i])) {
+                sendSingleRelay(i, desired[i]);
+                lastState[i] = desired[i];
+            }
+        }
+        firstRun = false;
+    }
+};
+
+// --- PHYSICS ENGINE ---
+void CalculatePhysics() {
+    string mode; { lock_guard<mutex> l(SYS.stateMutex); mode = SYS.currentMode; }
+    
+    // Calculate for Dispensing
+    if (mode == "WARM" || mode == "HOT") {
+        double flow_kg_s = (SYS.massFlowRateL_min / 60.0);
+        double target = (mode == "WARM") ? SYS.targetWarm : SYS.targetHot;
+        double deltaT = target - SYS.t1;
+        if (deltaT < 0) deltaT = 0;
+
+        double powerRequired = flow_kg_s * WATER_CP * deltaT;
+        double duty = powerRequired / SYS.heaterMaxPowerW;
+        if (duty > 1.0) duty = 1.0;
+        
+        SYS.calculatedPower = powerRequired;
+        SYS.heaterDutyCycle = duty;
+    } else {
+        // Clear physics values in Auto/Recirc mode (Heater is Bang-Bang there)
+        SYS.calculatedPower = 0;
+        SYS.heaterDutyCycle = 0;
+    }
+}
+
+// --- MAIN LOGIC LOOP ---
+void ControlLoop(RelayController* relays) {
+    this_thread::sleep_for(chrono::seconds(2)); // Initial Start Gap
+
+    while (true) {
+        this_thread::sleep_for(chrono::milliseconds(100));
+
+        string mode;
+        bool pouring;
+        double t2, t3, tankTarget, tankDeltaLimit;
+        {
+            lock_guard<mutex> l(SYS.stateMutex);
+            mode = SYS.currentMode;
+            tankTarget = SYS.tankTargetTemp;
+            tankDeltaLimit = SYS.tankMaxDelta;
+        }
+        t2 = SYS.t2; t3 = SYS.t3;
+        pouring = SYS.isPouring;
+
+        // Software PWM
+        static auto pwmStart = chrono::steady_clock::now();
+        long long ms = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - pwmStart).count();
+        if (ms >= 1000) { pwmStart = chrono::steady_clock::now(); ms = 0; }
+        bool heaterPwm = (ms < (SYS.heaterDutyCycle * 1000));
+
+        bool r_ev[7] = {0}; bool r_pump = 0; bool r_heat = 0;
+
+        // --- DISPENSING (WARM/HOT) ---
+        if (mode == "WARM" || mode == "HOT") {
+            CalculatePhysics();
+            static auto stateTimer = chrono::steady_clock::now();
+            
+            if (SYS.currentStage == "AUTO" || SYS.currentStage == "IDLE" || SYS.currentStage == "RECIRC") {
+                SYS.currentStage = "PRE";
+                stateTimer = chrono::steady_clock::now();
+            }
+
+            if (SYS.currentStage == "PRE") {
+                r_heat = true; 
+                SYS.statusMessage = (mode=="WARM"?"Warm":"Hot") + string(" Pre-heating...");
+                if (chrono::steady_clock::now() - stateTimer > chrono::seconds(SYS.preTimeSec)) 
+                    SYS.currentStage = "READY";
+            }
+            else if (SYS.currentStage == "READY") {
+                SYS.statusMessage = "Ready. Hold Pour.";
+                if (pouring) SYS.currentStage = "WHILE";
+            }
+            else if (SYS.currentStage == "WHILE") {
+                if (!pouring) {
+                    SYS.currentStage = "POST";
+                    stateTimer = chrono::steady_clock::now();
+                } else {
+                    r_pump = true; r_heat = heaterPwm;
+                    SYS.statusMessage = "Dispensing...";
+                    if(mode=="WARM") { r_ev[2]=1; r_ev[6]=1; }
+                    if(mode=="HOT")  { r_ev[1]=1; r_ev[4]=1; r_ev[6]=1; }
+                }
+            }
+            else if (SYS.currentStage == "POST") {
+                r_pump = true; r_ev[3]=1; r_ev[5]=1; 
+                SYS.statusMessage = "Post-cycle...";
+                if (chrono::steady_clock::now() - stateTimer > chrono::seconds(SYS.postTimeSec)) {
+                    lock_guard<mutex> l(SYS.stateMutex);
+                    SYS.currentMode = "AUTO"; // Back to Auto/Recirc
+                    SYS.currentStage = "IDLE";
+                }
+            }
+        }
+        // --- AUTO RECIRCULATION ---
+        else if (mode == "AUTO") {
+            static auto recircTimer = chrono::steady_clock::now();
+            
+            bool needsHeat = (t3 < tankTarget);
+            bool stratified = (abs(t3 - t2) > tankDeltaLimit);
+            bool conditionsMet = (needsHeat || stratified);
+
+            if (SYS.currentStage == "PRE" || SYS.currentStage == "READY" || SYS.currentStage == "WHILE") {
+                SYS.currentStage = "IDLE"; // Reset from manual modes
+            }
+
+            if (SYS.currentStage == "IDLE") {
+                r_ev[3]=0; r_ev[5]=0; r_pump=0; r_heat=0;
+                SYS.statusMessage = "System Idle (Temp OK)";
+                if (conditionsMet) {
+                    SYS.currentStage = "RECIRC";
+                }
+            }
+            else if (SYS.currentStage == "RECIRC") {
+                // If conditions are NO LONGER met (Target reached) -> Go to POST
+                if (!conditionsMet) {
+                    SYS.currentStage = "POST";
+                    recircTimer = chrono::steady_clock::now();
+                } else {
+                    r_ev[3] = 1; r_ev[5] = 1; r_pump = 1; r_heat = 1; // Full Heat
+                    stringstream ss; ss << "Recirculating: ";
+                    if(needsHeat) ss << "Heating Tank ";
+                    if(stratified) ss << "Mixing Stratification";
+                    SYS.statusMessage = ss.str();
+                }
+            }
+            else if (SYS.currentStage == "POST") {
+                // Recirc Post Routine
+                r_ev[3] = 1; r_ev[5] = 1; r_pump = 1; r_heat = 0; // Pump ON, Heater OFF
+                SYS.statusMessage = "Recirc Done. Post-Cooling...";
+                
+                if (chrono::steady_clock::now() - recircTimer > chrono::seconds(SYS.postTimeSec)) {
+                    SYS.currentStage = "IDLE";
+                }
+            }
+        }
+
+        relays->setRelays(r_ev[1], r_ev[2], r_ev[3], r_ev[4], r_ev[5], r_ev[6], r_pump, r_heat);
+    }
+}
+
+// --- WEB SERVER ---
+void RunWebServer() {
+    httplib::Server svr;
+
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        string html = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+    body { background: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; padding: 20px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1200px; margin: auto; }
+    .card { background: #1e1e1e; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
+    h2 { color: #bb86fc; border-bottom: 1px solid #333; padding-bottom:10px; margin-top:0; }
+    
+    .leds { display: grid; grid-template-columns: repeat(8, 1fr); text-align: center; font-size: 12px; }
+    .led { width: 15px; height: 15px; border-radius: 50%; background: #333; margin: 5px auto; transition: 0.3s; box-shadow: inset 1px 1px 2px #000; }
+    .led.on { background: #00ff00; box-shadow: 0 0 10px #00ff00; }
+    .led.heat.on { background: #ff0000 !important; box-shadow: 0 0 15px #ff0000; }
+
+    .btn-grp { display: flex; gap: 10px; margin: 15px 0; }
+    button { flex: 1; padding: 15px; border: none; font-weight: bold; cursor: pointer; color: #000; border-radius: 4px; }
+    .btn-warm { background: #ffb74d; } .btn-hot { background: #e57373; } .btn-auto { background: #64b5f6; }
+    #pourBtn { width: 100%; font-size: 20px; background: #03dac6; margin-top: 15px; }
+    #pourBtn:active { background: #018786; }
+
+    .input-row { display: flex; justify-content: space-between; margin: 8px 0; align-items: center; }
+    input[type=number] { width: 70px; background: #2c2c2c; border: 1px solid #444; color: white; padding: 5px; text-align:right;}
+    input[type=range] { flex: 1; margin: 0 10px; }
+    .val-display { font-family: monospace; color: #03dac6; }
+</style>
+</head>
+<body>
+<div class="grid">
+    <div>
+        <div class="card">
+            <h2>Dispensing Control</h2>
+            <div id="status" style="color: #bbb; height: 30px; font-style:italic;">Loading...</div>
+            <div class="btn-grp">
+                <button class="btn-warm" onclick="setMode('WARM')">WARM MODE</button>
+                <button class="btn-hot" onclick="setMode('HOT')">HOT MODE</button>
+                <button class="btn-auto" onclick="setMode('AUTO')">AUTO / CANCEL</button>
+            </div>
+            <button id="pourBtn" onmousedown="pour(1)" onmouseup="pour(0)" ontouchstart="pour(1)" ontouchend="pour(0)">HOLD TO POUR</button>
+        </div>
+        
+        <div class="card" style="margin-top:20px">
+            <h2>Physics Parameters (Config)</h2>
+            <div class="input-row"><label>Mass Flow (L/min)</label><input type="number" id="c_flow" value="1.0" step="0.1" onchange="cfg()"></div>
+            <div class="input-row"><label>Heater Power (W)</label><input type="number" id="c_pow" value="3000" step="100" onchange="cfg()"></div>
+            <hr style="border-color:#333">
+            <div class="input-row"><label>Required Power:</label><span id="calc_w" class="val-display">0 W</span></div>
+            <div class="input-row"><label>Duty Cycle:</label><span id="calc_d" class="val-display">0 %</span></div>
+        </div>
+
+        <div class="card" style="margin-top:20px">
+            <h2>Test Simulation Sensors</h2>
+            <div class="input-row"><label>T1 Inlet</label><input type="range" min="10" max="40" value="20" oninput="setSens('t1',this.value)"><span id="v_t1">20</span></div>
+            <div class="input-row"><label>T2 Tank Lo</label><input type="range" min="20" max="90" value="25" oninput="setSens('t2',this.value)"><span id="v_t2">25</span></div>
+            <div class="input-row"><label>T3 Tank Hi</label><input type="range" min="20" max="90" value="55" oninput="setSens('t3',this.value)"><span id="v_t3">55</span></div>
+        </div>
+    </div>
+
+    <div>
+        <div class="card">
+            <h2>Hardware Status</h2>
+            <div class="leds">
+                <div>E1<div id="l1" class="led"></div></div>
+                <div>E2<div id="l2" class="led"></div></div>
+                <div>E3<div id="l3" class="led"></div></div>
+                <div>E4<div id="l4" class="led"></div></div>
+                <div>E5<div id="l5" class="led"></div></div>
+                <div>E6<div id="l6" class="led"></div></div>
+                <div>PUMP<div id="lp" class="led"></div></div>
+                <div>HEAT<div id="lh" class="led heat"></div></div>
+            </div>
+            <p>Stage: <b id="stage" style="color:#03dac6">IDLE</b></p>
+        </div>
+
+        <div class="card" style="margin-top:20px">
+            <h2>Auto-Recirc Settings</h2>
+            <div class="input-row"><label>Tank Target (°C)</label><input type="number" id="c_tt" value="65" onchange="cfg()"></div>
+            <div class="input-row"><label>Max Delta T (°C)</label><input type="number" id="c_dt" value="2" onchange="cfg()"></div>
+        </div>
+        
+        <div class="card" style="margin-top:20px">
+            <h2>Dispense Settings</h2>
+            <div class="input-row"><label>Target Warm (°C)</label><input type="number" id="c_tw" value="40" onchange="cfg()"></div>
+            <div class="input-row"><label>Target Hot (°C)</label><input type="number" id="c_th" value="90" onchange="cfg()"></div>
+        </div>
+    </div>
+</div>
+<script>
+    function setMode(m) { fetch('/cmd?mode='+m); }
+    function pour(v) { fetch('/cmd?pour='+v); }
+    function setSens(id, v) { document.getElementById('v_'+id).innerText=v; fetch('/sensor?id='+id+'&val='+v); }
+    function cfg() {
+        let qs = `tt=${document.getElementById('c_tt').value}&dt=${document.getElementById('c_dt').value}` +
+                 `&tw=${document.getElementById('c_tw').value}&th=${document.getElementById('c_th').value}` +
+                 `&fl=${document.getElementById('c_flow').value}&pw=${document.getElementById('c_pow').value}`;
+        fetch('/config?'+qs);
+    }
+    setInterval(()=>{
+        fetch('/status').then(r=>r.json()).then(d=>{
+            for(let i=1;i<=6;i++) document.getElementById('l'+i).className='led '+(d.ev[i]?'on':'');
+            document.getElementById('lp').className='led '+(d.pump?'on':'');
+            document.getElementById('lh').className='led heat '+(d.heat?'on':'');
+            
+            document.getElementById('status').innerText = d.msg;
+            document.getElementById('stage').innerText = d.stage;
+            document.getElementById('calc_w').innerText = d.power.toFixed(0) + " W";
+            document.getElementById('calc_d').innerText = (d.duty*100).toFixed(0) + " %";
+        });
+    }, 500);
+</script>
+</body>
+</html>
+        )HTML";
+        res.set_content(html, "text/html");
+    });
+
+    svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
+        stringstream ss;
+        ss << "{ \"ev\":[0," << SYS.ev[1] << "," << SYS.ev[2] << "," << SYS.ev[3] << "," 
+           << SYS.ev[4] << "," << SYS.ev[5] << "," << SYS.ev[6] << "], \"pump\":" << SYS.pump 
+           << ", \"heat\":" << SYS.heater << ", \"duty\":" << SYS.heaterDutyCycle
+           << ", \"power\":" << SYS.calculatedPower;
+        { lock_guard<mutex> l(SYS.stateMutex); 
+          ss << ", \"msg\":\"" << SYS.statusMessage << "\", \"stage\":\"" << SYS.currentStage << "\""; }
+        ss << "}";
+        res.set_content(ss.str(), "application/json");
+    });
+
+    svr.Get("/cmd", [](const httplib::Request& req, httplib::Response& res) {
+        if(req.has_param("mode")) {
+            lock_guard<mutex> l(SYS.stateMutex);
+            SYS.currentMode = req.get_param_value("mode");
+            SYS.currentStage = "AUTO"; // Reset
+        }
+        if(req.has_param("pour")) SYS.isPouring = (req.get_param_value("pour") == "1");
+        res.set_content("OK", "text/plain");
+    });
+
+    svr.Get("/sensor", [](const httplib::Request& req, httplib::Response& res) {
+        string id = req.get_param_value("id"); double v = stod(req.get_param_value("val"));
+        if(id=="t1") SYS.t1=v; if(id=="t2") SYS.t2=v; if(id=="t3") SYS.t3=v;
+        res.set_content("OK", "text/plain");
+    });
+
+    svr.Get("/config", [](const httplib::Request& req, httplib::Response& res) {
+        try {
+            if(req.has_param("tt")) SYS.tankTargetTemp = stod(req.get_param_value("tt"));
+            if(req.has_param("dt")) SYS.tankMaxDelta = stod(req.get_param_value("dt"));
+            if(req.has_param("tw")) SYS.targetWarm = stod(req.get_param_value("tw"));
+            if(req.has_param("th")) SYS.targetHot = stod(req.get_param_value("th"));
+            if(req.has_param("fl")) SYS.massFlowRateL_min = stod(req.get_param_value("fl"));
+            if(req.has_param("pw")) SYS.heaterMaxPowerW = stod(req.get_param_value("pw"));
+        } catch(...) {}
+        res.set_content("OK", "text/plain");
+    });
+
+    cout << "System Running at http://localhost:8090" << endl;
+    svr.listen("0.0.0.0", 8090);
+}
+
+int main() {
+    SerialPort p("COM9");
+    RelayController r(&p);
+    thread t(ControlLoop, &r);
+    t.detach();
+    RunWebServer();
     return 0;
 }
