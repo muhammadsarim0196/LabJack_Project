@@ -1,9 +1,8 @@
 /**
- * SMART HYDRAULIC CONTROL SYSTEM (FULL SIMULATION CONTROL)
- * --------------------------------------------------------
- * - Inputs: Toggle between Live Sensors (Type T) or Slider Simulation
- * - Outputs: Toggle between Live Relays or LED-Only Simulation
- * - Hardware: LabJack T7 + DSD Tech Relays
+ * SMART HYDRAULIC CONTROL SYSTEM (.LOAD() COMPILER FIX)
+ * -----------------------------------------------------
+ * - Fixed std::atomic assignment deleted function errors
+ * - Explicit .load() calls for thread-safe value extraction
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -26,6 +25,15 @@ using namespace std;
 
 // --- CONFIGURATION CONSTANTS ---
 const double WATER_CP = 4186.0; 
+const double MAX_POWER_PER_ZONE = 400.0; // 2x200W elements per zone
+const long   HEATER_STAGGER_MS = 500;    // Delay between zone activations
+
+// --- INFLUXDB CONFIGURATION ---
+const char* INFLUX_HOST = "localhost";
+const int   INFLUX_PORT = 8086;
+const char* INFLUX_ORG  = "AQL";               
+const char* INFLUX_BUCKET = "AQL_Bucket";      
+const char* INFLUX_TOKEN = "6QfQ73FZc9Yw_BsfB1rX1dM2PQXivn_Hwd6jTMEBVunAlugvqo7u6Z5qjLa_rCokFdUOTuufOxQxeLVUhiAPeg=="; 
 
 // --- GLOBAL SHARED STATE ---
 struct SystemState {
@@ -38,32 +46,43 @@ struct SystemState {
     // Raw Real Sensor Data
     atomic<double> realSensors[6]; 
 
-    // Simulation Overrides
+    // Toggles
     atomic<double> simSensors[4]; 
-    atomic<bool>   useSensorSimulation{true}; // Input Toggle
-    atomic<bool>   useRelaySimulation{true};  // Output Toggle (NEW)
+    atomic<bool>   useSensorSimulation{true}; 
+    atomic<bool>   useRelaySimulation{true};  
 
-    // User Config
+    // User Config & Timers
     atomic<double> targetWarm{40.0};
     atomic<double> targetHot{90.0};
     atomic<double> massFlowRateL_min{1.0};
-    atomic<double> heaterMaxPowerW{3000.0};
-    atomic<int>    preTimeSec{5};
-    atomic<int>    postTimeSec{5};
+    atomic<double> heaterMaxLimitW{1000.0}; 
+    atomic<int>    preTimeSec{5};           
+    atomic<int>    postTimeSec{5};          
     atomic<double> tankTargetTemp{65.0}; 
     atomic<double> tankMaxDelta{2.0};    
 
+    // Heat Flux Equalizer 
+    atomic<double> eqInlet{10.0};
+    atomic<double> eqCenter{10.0};
+    atomic<double> eqOutlet{10.0};
+
     // System Status
-    atomic<double> calculatedPower{0.0};
-    atomic<double> heaterDutyCycle{0.0};
+    atomic<double> rawRequiredPower{0.0}; 
+    atomic<bool>   powerExceeded{false};  
+    atomic<double> totalCalculatedPower{0.0};
+    atomic<double> zonePower[3]; 
+    atomic<double> zoneDuty[3];  
+    atomic<double> activeDuty[3]; 
+    
     string currentMode = "AUTO";         
+    string targetMode  = "AUTO";      
     string currentStage = "IDLE";        
     string statusMessage = "Initializing...";
 
-    // Relays (Logic State for Dashboard)
+    // Relays
     bool ev[7] = {0}; 
     bool pump = false;
-    bool heater = false;
+    bool h[3] = {0}; 
 
     // Flags
     atomic<bool> isPouring{false}; 
@@ -113,7 +132,6 @@ public:
             return;
         }
         connected = true;
-        
         const int NUM_FRAMES = 18;
         const char *configNames[NUM_FRAMES] = {
             "AIN48_NEGATIVE_CH", "AIN49_NEGATIVE_CH", "AIN50_NEGATIVE_CH", 
@@ -136,10 +154,10 @@ public:
         int err = LJM_eReadNames(handle, 6, readNames, readValues, &errAddress);
         if(err == 0) {
             for(int i=0; i<6; i++) {
-                if(readValues[i] > -200.0 && readValues[i] < 1200.0) {
+                if(readValues[i] > -5.0 && readValues[i] < 110.0) {
                     SYS.realSensors[i] = readValues[i];
                 } else {
-                    SYS.realSensors[i] = -999.0; // NC
+                    SYS.realSensors[i] = -999.0; // NC Filter
                 }
             }
         }
@@ -147,10 +165,10 @@ public:
     ~SensorManager() { if(connected) LJM_Close(handle); }
 };
 
-// --- 3. RELAY CONTROLLER (UPDATED FOR SIM TOGGLE) ---
+// --- 3. RELAY CONTROLLER ---
 class RelayController {
     SerialPort* serial;
-    bool lastState[9] = {false}; 
+    bool lastState[12] = {false}; 
     bool firstRun = true;
 
     unsigned short crc16(const vector<unsigned char>& data) {
@@ -167,33 +185,30 @@ class RelayController {
 public:
     RelayController(SerialPort* sp) : serial(sp) {}
 
-    void setRelays(bool ev1, bool ev2, bool ev3, bool ev4, bool ev5, bool ev6, bool pump, bool heater) {
-        // 1. Always update UI State (Visuals work in Sim mode)
+    void setRelays(bool ev1, bool ev2, bool ev3, bool ev4, bool ev5, bool ev6, bool pump, bool h1, bool h2, bool h3) {
         {
             lock_guard<mutex> lock(SYS.stateMutex);
             SYS.ev[1] = ev1; SYS.ev[2] = ev2; SYS.ev[3] = ev3;
             SYS.ev[4] = ev4; SYS.ev[5] = ev5; SYS.ev[6] = ev6;
-            SYS.pump = pump; SYS.heater = heater;
+            SYS.pump = pump; 
+            SYS.h[0] = h1; SYS.h[1] = h2; SYS.h[2] = h3;
         }
 
-        // 2. Determine Hardware State
-        // If Sim Mode is ON, force all hardware pins to FALSE (OFF)
-        // If Live Mode is ON, use the actual logic values
-        bool useSim = SYS.useRelaySimulation;
-        
-        bool hw_ev1 = useSim ? false : ev1;
-        bool hw_ev2 = useSim ? false : ev2;
-        bool hw_ev3 = useSim ? false : ev3;
-        bool hw_ev4 = useSim ? false : ev4;
-        bool hw_ev5 = useSim ? false : ev5;
-        bool hw_ev6 = useSim ? false : ev6;
-        bool hw_pump = useSim ? false : pump;
-        bool hw_heat = useSim ? false : heater;
+        bool useSim = SYS.useRelaySimulation.load();
+        bool desired[12] = {false};
+        desired[1] = useSim ? false : ev1;
+        desired[2] = useSim ? false : ev2;
+        desired[3] = useSim ? false : ev3;
+        desired[4] = useSim ? false : ev4;
+        desired[5] = useSim ? false : ev5;
+        desired[6] = useSim ? false : ev6;
+        desired[7] = useSim ? false : pump;
+        desired[9] = useSim ? false : h1; 
+        desired[10]= useSim ? false : h2; 
+        desired[11]= useSim ? false : h3; 
 
-        bool desired[9] = {false, hw_ev1, hw_ev2, hw_ev3, hw_ev4, hw_ev5, hw_ev6, hw_pump, hw_heat};
-
-        // 3. Send to Hardware (Smart Diff)
-        for (int i = 1; i <= 8; i++) {
+        for (int i = 1; i <= 11; i++) {
+            if (i == 8) continue; 
             if (firstRun || (desired[i] != lastState[i])) {
                 unsigned char val = desired[i] ? 0x01 : 0x02; 
                 vector<unsigned char> cmd = {0x01, 0x06, 0x00, (unsigned char)i, val, 0x00};
@@ -209,121 +224,194 @@ public:
     }
 };
 
-// --- 4. PHYSICS ENGINE ---
+// --- 4. INFLUXDB LOGGER ---
+void InfluxLoggerThread() {
+    httplib::Client cli(INFLUX_HOST, INFLUX_PORT);
+    string tokenHeader = "Token " + string(INFLUX_TOKEN);
+    cli.set_connection_timeout(1);
+
+    while (true) {
+        this_thread::sleep_for(chrono::seconds(1)); 
+        
+        // EXPLICIT LOAD() for all atomics
+        double t1 = SYS.t1.load(), t2 = SYS.t2.load(), t3 = SYS.t3.load(), t4 = SYS.t4.load();
+        double p1 = SYS.zonePower[0].load(), p2 = SYS.zonePower[1].load(), p3 = SYS.zonePower[2].load();
+        
+        string mode; 
+        { lock_guard<mutex> l(SYS.stateMutex); mode = SYS.currentMode; }
+
+        stringstream ss; ss << fixed << setprecision(2);
+        ss << "thermal_system,unit=labjack,mode=" << mode 
+           << " t1=" << t1 << ",t2=" << t2 << ",t3=" << t3 << ",t4=" << t4
+           << ",power_inlet=" << p1 << ",power_center=" << p2 << ",power_outlet=" << p3
+           << ",pump=" << (SYS.pump ? 1 : 0);
+
+        string path = "/api/v2/write?org=" + string(INFLUX_ORG) + "&bucket=" + string(INFLUX_BUCKET) + "&precision=s";
+        httplib::Headers headers = { {"Authorization", tokenHeader}, {"Content-Type", "text/plain"} };
+        cli.Post(path.c_str(), headers, ss.str(), "text/plain");
+    }
+}
+
+// --- 5. PHYSICS ENGINE ---
 void CalculatePhysics() {
     string mode; { lock_guard<mutex> l(SYS.stateMutex); mode = SYS.currentMode; }
     
     if (mode == "WARM" || mode == "HOT") {
-        double flow_kg_s = (SYS.massFlowRateL_min / 60.0);
-        double target = (mode == "WARM") ? SYS.targetWarm : SYS.targetHot;
-        double deltaT = target - SYS.t1; 
-        if (deltaT < 0) deltaT = 0;
+        // EXPLICIT LOAD() for all atomics
+        double flow_kg_s = (SYS.massFlowRateL_min.load() / 60.0);
+        double deltaT = 0.0;
+
+        if (mode == "WARM") deltaT = SYS.targetWarm.load() - SYS.t1.load();
+        else if (mode == "HOT") deltaT = SYS.targetHot.load() - SYS.t3.load(); 
+
+        if (deltaT < 0) deltaT = 0; 
 
         double powerRequired = flow_kg_s * WATER_CP * deltaT;
-        double duty = powerRequired / SYS.heaterMaxPowerW;
-        if (duty > 1.0) duty = 1.0;
+        SYS.rawRequiredPower = powerRequired;
+        double globalLimit = SYS.heaterMaxLimitW.load();
+        SYS.powerExceeded = (powerRequired > globalLimit); 
+        double activePower = min(powerRequired, globalLimit);
+
+        double r1 = SYS.eqInlet.load(), r2 = SYS.eqCenter.load(), r3 = SYS.eqOutlet.load();
+        double totalRatio = r1 + r2 + r3;
+        if (totalRatio < 0.01) totalRatio = 0.01; 
+
+        double p1 = activePower * (r1 / totalRatio);
+        double p2 = activePower * (r2 / totalRatio);
+        double p3 = activePower * (r3 / totalRatio);
+
+        double d1 = p1 / MAX_POWER_PER_ZONE; if(d1 > 1.0) d1 = 1.0;
+        double d2 = p2 / MAX_POWER_PER_ZONE; if(d2 > 1.0) d2 = 1.0;
+        double d3 = p3 / MAX_POWER_PER_ZONE; if(d3 > 1.0) d3 = 1.0;
+
+        SYS.zoneDuty[0] = d1; SYS.zonePower[0] = d1 * MAX_POWER_PER_ZONE;
+        SYS.zoneDuty[1] = d2; SYS.zonePower[1] = d2 * MAX_POWER_PER_ZONE;
+        SYS.zoneDuty[2] = d3; SYS.zonePower[2] = d3 * MAX_POWER_PER_ZONE;
+        SYS.totalCalculatedPower = SYS.zonePower[0].load() + SYS.zonePower[1].load() + SYS.zonePower[2].load();
         
-        SYS.calculatedPower = powerRequired;
-        SYS.heaterDutyCycle = duty;
     } else {
-        SYS.calculatedPower = 0;
-        SYS.heaterDutyCycle = 0;
+        SYS.totalCalculatedPower = 0;
+        SYS.rawRequiredPower = 0;
+        SYS.powerExceeded = false;
+        for(int i=0; i<3; i++) { SYS.zonePower[i] = MAX_POWER_PER_ZONE; SYS.zoneDuty[i] = 1.0; }
     }
 }
 
-// --- 5. MAIN LOGIC LOOP ---
+// --- 6. MAIN LOGIC LOOP ---
 void ControlLoop(RelayController* relays, SensorManager* sensors) {
     this_thread::sleep_for(chrono::seconds(2));
 
+    auto stateTimer = chrono::steady_clock::now();
+
     while (true) {
         this_thread::sleep_for(chrono::milliseconds(100));
-        
-        // READ SENSORS
         sensors->read();
 
-        // MAP VALUES (Sim vs Real)
-        if (SYS.useSensorSimulation) {
-            SYS.t1 = (double)SYS.simSensors[0];
-            SYS.t2 = (double)SYS.simSensors[1];
-            SYS.t3 = (double)SYS.simSensors[2];
-            SYS.t4 = (double)SYS.simSensors[3];
+        // EXPLICIT LOAD() for all mappings
+        if (SYS.useSensorSimulation.load()) {
+            SYS.t1 = SYS.simSensors[0].load(); 
+            SYS.t2 = SYS.simSensors[1].load();
+            SYS.t3 = SYS.simSensors[2].load(); 
+            SYS.t4 = SYS.simSensors[3].load();
         } else {
-            SYS.t1 = (SYS.realSensors[0] < -900) ? 25.0 : (double)SYS.realSensors[0]; 
-            SYS.t2 = (SYS.realSensors[1] < -900) ? 25.0 : (double)SYS.realSensors[1]; 
-            SYS.t3 = (SYS.realSensors[2] < -900) ? 25.0 : (double)SYS.realSensors[2]; 
-            SYS.t4 = (SYS.realSensors[3] < -900) ? 25.0 : (double)SYS.realSensors[3]; 
+            SYS.t1 = (SYS.realSensors[0].load() < -900) ? 25.0 : SYS.realSensors[0].load(); 
+            SYS.t2 = (SYS.realSensors[1].load() < -900) ? 25.0 : SYS.realSensors[1].load(); 
+            SYS.t3 = (SYS.realSensors[2].load() < -900) ? 25.0 : SYS.realSensors[2].load(); 
+            SYS.t4 = (SYS.realSensors[3].load() < -900) ? 25.0 : SYS.realSensors[3].load(); 
         }
 
-        // READ STATE
-        string mode;
-        bool pouring;
+        string mode, targetMode;
         double t2, t3, tankTarget, tankDeltaLimit;
+        bool pouring;
         {
             lock_guard<mutex> l(SYS.stateMutex);
             mode = SYS.currentMode;
-            tankTarget = SYS.tankTargetTemp;
-            tankDeltaLimit = SYS.tankMaxDelta;
+            targetMode = SYS.targetMode;
         }
-        t2 = SYS.t2; t3 = SYS.t3;
-        pouring = SYS.isPouring;
+        
+        // EXPLICIT LOAD() to avoid compiler confusion
+        t2 = SYS.t2.load(); 
+        t3 = SYS.t3.load();
+        tankTarget = SYS.tankTargetTemp.load();
+        tankDeltaLimit = SYS.tankMaxDelta.load();
+        pouring = SYS.isPouring.load();
 
-        // HEATER PWM
-        static auto pwmStart = chrono::steady_clock::now();
-        long long ms = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - pwmStart).count();
-        if (ms >= 1000) { pwmStart = chrono::steady_clock::now(); ms = 0; }
-        bool heaterPwm = (ms < (SYS.heaterDutyCycle * 1000));
-
-        bool r_ev[7] = {0}; bool r_pump = 0; bool r_heat = 0;
-
-        // STATE MACHINE
-        if (mode == "WARM" || mode == "HOT") {
-            CalculatePhysics();
-            static auto stateTimer = chrono::steady_clock::now();
-            
-            if (SYS.currentStage == "AUTO" || SYS.currentStage == "IDLE" || SYS.currentStage == "RECIRC") {
-                SYS.currentStage = "PRE";
+        // --- SAFE TRANSITION LOGIC ---
+        if (mode != targetMode) {
+            if (SYS.currentStage == "IDLE" || SYS.currentStage == "READY") {
+                lock_guard<mutex> l(SYS.stateMutex);
+                SYS.currentMode = targetMode;
+                SYS.currentStage = (targetMode == "AUTO") ? "IDLE" : "READY";
+                stateTimer = chrono::steady_clock::now(); 
+                mode = targetMode;
+            } else if (SYS.currentStage != "POST") {
+                SYS.currentStage = "POST";
                 stateTimer = chrono::steady_clock::now();
+            } else {
+                SYS.statusMessage = "Cooling down before switching to " + targetMode + "...";
             }
+        }
 
-            if (SYS.currentStage == "PRE") {
-                r_heat = true; 
-                SYS.statusMessage = (mode=="WARM"?"Warm":"Hot") + string(" Pre-heating...");
-                if (chrono::steady_clock::now() - stateTimer > chrono::seconds(SYS.preTimeSec)) 
-                    SYS.currentStage = "READY";
+        CalculatePhysics();
+        string warningText = SYS.powerExceeded.load() ? " | LIMIT EXCEEDED" : "";
+
+        // --- STATE MACHINE ---
+        bool r_ev[7] = {0}; bool r_pump = 0; 
+        bool stageWantsHeat = false;
+
+        if (mode == "WARM" || mode == "HOT") {
+            if (SYS.currentStage == "READY") {
+                auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - stateTimer).count();
+                if (elapsed >= 20) { 
+                    lock_guard<mutex> l(SYS.stateMutex);
+                    SYS.targetMode = "AUTO"; 
+                } else {
+                    SYS.statusMessage = string(mode == "WARM" ? "Warm" : "Hot") + " Mode. Ready (" + to_string(20 - elapsed) + "s) " + warningText;
+                    if (pouring) {
+                        SYS.currentStage = "PRE";
+                        stateTimer = chrono::steady_clock::now();
+                    }
+                }
             }
-            else if (SYS.currentStage == "READY") {
-                SYS.statusMessage = "Ready. Hold Pour.";
-                if (pouring) SYS.currentStage = "WHILE";
+            else if (SYS.currentStage == "PRE") {
+                if (!pouring) {
+                    SYS.currentStage = "POST";
+                    stateTimer = chrono::steady_clock::now();
+                } else {
+                    stageWantsHeat = true;
+                    auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - stateTimer).count();
+                    long rem = SYS.preTimeSec.load() - elapsed;
+                    if (rem <= 0) SYS.currentStage = "WHILE"; 
+                    else SYS.statusMessage = "Pre-heating... " + to_string(rem) + "s" + warningText;
+                }
             }
             else if (SYS.currentStage == "WHILE") {
                 if (!pouring) {
                     SYS.currentStage = "POST";
                     stateTimer = chrono::steady_clock::now();
                 } else {
-                    r_pump = true; r_heat = heaterPwm;
-                    SYS.statusMessage = "Dispensing...";
+                    r_pump = true; stageWantsHeat = true;
+                    SYS.statusMessage = "Dispensing..." + warningText;
                     if(mode=="WARM") { r_ev[2]=1; r_ev[6]=1; }
                     if(mode=="HOT")  { r_ev[1]=1; r_ev[4]=1; r_ev[6]=1; }
                 }
             }
             else if (SYS.currentStage == "POST") {
                 r_pump = true; r_ev[3]=1; r_ev[5]=1; 
-                SYS.statusMessage = "Post-cycle...";
-                if (chrono::steady_clock::now() - stateTimer > chrono::seconds(SYS.postTimeSec)) {
-                    lock_guard<mutex> l(SYS.stateMutex);
-                    SYS.currentMode = "AUTO"; 
-                    SYS.currentStage = "IDLE";
+                auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - stateTimer).count();
+                long rem = SYS.postTimeSec.load() - elapsed;
+                if (rem <= 0) {
+                    SYS.currentStage = "READY"; 
+                    stateTimer = chrono::steady_clock::now(); 
+                } else {
+                    SYS.statusMessage = "Post-cycle cooling... " + to_string(rem) + "s";
                 }
             }
         }
         else if (mode == "AUTO") {
-            static auto recircTimer = chrono::steady_clock::now();
             bool needsHeat = (t3 < tankTarget);
             bool stratified = (abs(t3 - t2) > tankDeltaLimit);
             bool conditionsMet = (needsHeat || stratified);
-
-            if (SYS.currentStage != "IDLE" && SYS.currentStage != "RECIRC" && SYS.currentStage != "POST") 
-                SYS.currentStage = "IDLE";
 
             if (SYS.currentStage == "IDLE") {
                 SYS.statusMessage = "System Idle (Temp OK)";
@@ -332,25 +420,58 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
             else if (SYS.currentStage == "RECIRC") {
                 if (!conditionsMet) {
                     SYS.currentStage = "POST";
-                    recircTimer = chrono::steady_clock::now();
+                    stateTimer = chrono::steady_clock::now();
                 } else {
-                    r_ev[3] = 1; r_ev[5] = 1; r_pump = 1; r_heat = 1; 
+                    r_ev[3] = 1; r_ev[5] = 1; r_pump = 1; stageWantsHeat = true;
                     SYS.statusMessage = "Recirculating...";
                 }
             }
             else if (SYS.currentStage == "POST") {
-                r_ev[3] = 1; r_ev[5] = 1; r_pump = 1; r_heat = 0; 
-                SYS.statusMessage = "Recirc Done. Cooling...";
-                if (chrono::steady_clock::now() - recircTimer > chrono::seconds(SYS.postTimeSec)) 
-                    SYS.currentStage = "IDLE";
+                r_ev[3] = 1; r_ev[5] = 1; r_pump = 1; 
+                auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - stateTimer).count();
+                long rem = SYS.postTimeSec.load() - elapsed;
+                if (rem <= 0) SYS.currentStage = "IDLE";
+                else SYS.statusMessage = "Recirc Done. Cooling... " + to_string(rem) + "s";
             }
         }
 
-        relays->setRelays(r_ev[1], r_ev[2], r_ev[3], r_ev[4], r_ev[5], r_ev[6], r_pump, r_heat);
+        // --- STAGGERED HEATER LOGIC ---
+        static bool lastHeatingEnabled = false;
+        static auto heatChangeTime = chrono::steady_clock::now();
+
+        if (stageWantsHeat != lastHeatingEnabled) {
+            lastHeatingEnabled = stageWantsHeat;
+            heatChangeTime = chrono::steady_clock::now();
+        }
+
+        long heatElapsedMs = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - heatChangeTime).count();
+        bool allowH[3] = {false, false, false}; 
+
+        if (stageWantsHeat) {
+            allowH[0] = true;
+            allowH[1] = (heatElapsedMs > HEATER_STAGGER_MS);
+            allowH[2] = (heatElapsedMs > (HEATER_STAGGER_MS * 2));
+        } else {
+            allowH[2] = false;
+            allowH[1] = (heatElapsedMs < HEATER_STAGGER_MS);
+            allowH[0] = (heatElapsedMs < (HEATER_STAGGER_MS * 2));
+        }
+
+        static auto pwmStart = chrono::steady_clock::now();
+        long long ms = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - pwmStart).count();
+        if (ms >= 1000) { pwmStart = chrono::steady_clock::now(); ms = 0; }
+        
+        bool r_h[3];
+        for (int i=0; i<3; i++) {
+            r_h[i] = allowH[i] && (ms < (SYS.zoneDuty[i].load() * 1000));
+            SYS.activeDuty[i] = allowH[i] ? SYS.zoneDuty[i].load() : 0.0; 
+        }
+
+        relays->setRelays(r_ev[1], r_ev[2], r_ev[3], r_ev[4], r_ev[5], r_ev[6], r_pump, r_h[0], r_h[1], r_h[2]);
     }
 }
 
-// --- 6. WEB SERVER ---
+// --- 7. WEB SERVER ---
 void RunWebServer() {
     httplib::Server svr;
 
@@ -361,39 +482,41 @@ void RunWebServer() {
 <head>
 <meta charset="UTF-8">
 <style>
-    body { background: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; padding: 20px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1200px; margin: auto; }
-    .card { background: #1e1e1e; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
-    h2 { color: #bb86fc; border-bottom: 1px solid #333; padding-bottom:10px; margin-top:0; }
+    body { background: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; padding: 20px; font-size: 14px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1300px; margin: auto; }
+    .card { background: #1e1e1e; padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); margin-bottom: 20px;}
+    h2 { color: #bb86fc; border-bottom: 1px solid #333; padding-bottom:5px; margin-top:0; font-size: 18px;}
     
-    .leds { display: grid; grid-template-columns: repeat(8, 1fr); text-align: center; font-size: 12px; }
-    .led { width: 15px; height: 15px; border-radius: 50%; background: #333; margin: 5px auto; transition: 0.3s; box-shadow: inset 1px 1px 2px #000; }
+    .leds { display: grid; grid-template-columns: repeat(10, 1fr); text-align: center; font-size: 11px; }
+    .led { width: 14px; height: 14px; border-radius: 50%; background: #333; margin: 5px auto; transition: 0.3s; box-shadow: inset 1px 1px 2px #000; }
     .led.on { background: #00ff00; box-shadow: 0 0 10px #00ff00; }
     .led.heat.on { background: #ff0000 !important; box-shadow: 0 0 15px #ff0000; }
 
-    .btn-grp { display: flex; gap: 10px; margin: 15px 0; }
-    button { flex: 1; padding: 15px; border: none; font-weight: bold; cursor: pointer; color: #000; border-radius: 4px; }
+    .btn-grp { display: flex; gap: 10px; margin: 10px 0; }
+    button { flex: 1; padding: 12px; border: none; font-weight: bold; cursor: pointer; color: #000; border-radius: 4px; }
     .btn-warm { background: #ffb74d; } .btn-hot { background: #e57373; } .btn-auto { background: #64b5f6; }
-    
-    #pourBtn { width: 100%; font-size: 20px; background: #03dac6; margin-top: 15px; }
+    #pourBtn { width: 100%; font-size: 18px; background: #03dac6; margin-top: 10px; }
     #pourBtn:active { background: #018786; }
 
-    /* SWITCH STYLES */
-    .toggle-container { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; background: #333; padding: 10px; border-radius: 5px; }
-    .switch { position: relative; display: inline-block; width: 60px; height: 34px; }
+    .toggle-container { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; background: #333; padding: 8px; border-radius: 5px; }
+    .switch { position: relative; display: inline-block; width: 50px; height: 26px; }
     .switch input { opacity: 0; width: 0; height: 0; }
     .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
-    .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
+    .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
     input:checked + .slider { background-color: #2196F3; }
-    input:checked + .slider:before { transform: translateX(26px); }
+    input:checked + .slider:before { transform: translateX(24px); }
 
-    .input-row { display: flex; justify-content: space-between; margin: 8px 0; align-items: center; }
-    input[type=number] { width: 70px; background: #2c2c2c; border: 1px solid #444; color: white; padding: 5px; text-align:right;}
+    .input-row { display: flex; justify-content: space-between; margin: 6px 0; align-items: center; }
+    input[type=number] { width: 60px; background: #2c2c2c; border: 1px solid #444; color: white; padding: 4px; text-align:right;}
     input[type=range] { flex: 1; margin: 0 10px; }
     
-    .live-data { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; font-family: monospace; color: #03dac6; font-size: 14px; }
-    .live-box { background: #222; padding: 5px; text-align: center; border: 1px solid #444; border-radius: 4px; transition: 0.3s; }
+    .live-data { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; font-family: monospace; color: #03dac6; font-size: 12px; }
+    .live-box { background: #222; padding: 5px; text-align: center; border: 1px solid #444; border-radius: 4px; }
     .live-box.disconnected { opacity: 0.3; border-color: #555; color: #555; }
+
+    .eq-grid { display: grid; grid-template-columns: 1fr 2fr 1fr; gap: 5px; text-align: center; font-family: monospace; font-size: 12px; margin-bottom: 10px;}
+    .val-display { color: #ffb74d; }
+    .warning { color: #ff4444; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -401,7 +524,7 @@ void RunWebServer() {
     <div>
         <div class="card">
             <h2>Dispensing Control</h2>
-            <div id="status" style="color: #bbb; height: 30px; font-style:italic;">Loading...</div>
+            <div id="status" style="color: #bbb; height: 40px; font-style:italic; font-size:16px;">Loading...</div>
             <div class="btn-grp">
                 <button class="btn-warm" onclick="setMode('WARM')">WARM MODE</button>
                 <button class="btn-hot" onclick="setMode('HOT')">HOT MODE</button>
@@ -410,25 +533,8 @@ void RunWebServer() {
             <button id="pourBtn" onmousedown="pour(1)" onmouseup="pour(0)" ontouchstart="pour(1)" ontouchend="pour(0)">HOLD TO POUR</button>
         </div>
 
-        <div class="card" style="margin-top:20px">
-            <h2>Input Source (Sensors)</h2>
-            <div class="toggle-container">
-                <span id="sourceLabel"><b>SIMULATION</b></span>
-                <label class="switch">
-                    <input type="checkbox" id="simToggle" checked onchange="toggleSim()">
-                    <span class="slider"></span>
-                </label>
-            </div>
-            
-            <div id="simControls">
-                <div class="input-row"><label>T1 Inlet</label><input type="range" min="10" max="40" value="20" oninput="setSens('t1',this.value)"><span id="v_t1">20</span></div>
-                <div class="input-row"><label>T2 Tank Lo</label><input type="range" min="20" max="90" value="25" oninput="setSens('t2',this.value)"><span id="v_t2">25</span></div>
-                <div class="input-row"><label>T3 Tank Hi</label><input type="range" min="20" max="90" value="55" oninput="setSens('t3',this.value)"><span id="v_t3">55</span></div>
-            </div>
-        </div>
-
-        <div class="card" style="margin-top:20px">
-            <h2>Live Readings</h2>
+        <div class="card">
+            <h2>Hardware Sensors (Live)</h2>
             <div class="live-data">
                 <div class="live-box" id="box0">T0(Inlet)<br><span id="r0">--</span>°C</div>
                 <div class="live-box" id="box1">T1(TkLo)<br><span id="r1">--</span>°C</div>
@@ -436,6 +542,16 @@ void RunWebServer() {
                 <div class="live-box" id="box3">T3(Out)<br><span id="r3">--</span>°C</div>
                 <div class="live-box" id="box4">T4(Aux)<br><span id="r4">--</span>°C</div>
                 <div class="live-box" id="box5">T5(Aux)<br><span id="r5">--</span>°C</div>
+            </div>
+            <br>
+            <div class="toggle-container">
+                <span id="sourceLabel">INPUT: <b>SIMULATION</b></span>
+                <label class="switch"><input type="checkbox" id="simToggle" checked onchange="toggleSim()"><span class="slider"></span></label>
+            </div>
+            <div id="simControls">
+                <div class="input-row"><label>T1 Inlet</label><input type="range" min="10" max="40" value="20" oninput="setSens('t1',this.value)"><span id="v_t1">20</span></div>
+                <div class="input-row"><label>T2 Tank Lo</label><input type="range" min="20" max="90" value="25" oninput="setSens('t2',this.value)"><span id="v_t2">25</span></div>
+                <div class="input-row"><label>T3 Tank Hi</label><input type="range" min="20" max="90" value="55" oninput="setSens('t3',this.value)"><span id="v_t3">55</span></div>
             </div>
         </div>
     </div>
@@ -445,10 +561,7 @@ void RunWebServer() {
             <h2>Hardware Status</h2>
             <div class="toggle-container" style="border: 1px solid #444;">
                 <span id="relayLabel">OUTPUT: <b>SIMULATED</b></span>
-                <label class="switch">
-                    <input type="checkbox" id="relayToggle" checked onchange="toggleRelay()">
-                    <span class="slider"></span>
-                </label>
+                <label class="switch"><input type="checkbox" id="relayToggle" checked onchange="toggleRelay()"><span class="slider"></span></label>
             </div>
             <div class="leds">
                 <div>E1<div id="l1" class="led"></div></div>
@@ -457,26 +570,48 @@ void RunWebServer() {
                 <div>E4<div id="l4" class="led"></div></div>
                 <div>E5<div id="l5" class="led"></div></div>
                 <div>E6<div id="l6" class="led"></div></div>
-                <div>PUMP<div id="lp" class="led"></div></div>
-                <div>HEAT<div id="lh" class="led heat"></div></div>
+                <div>PMP<div id="lp" class="led"></div></div>
+                <div>H1<div id="h0" class="led heat"></div></div>
+                <div>H2<div id="h1" class="led heat"></div></div>
+                <div>H3<div id="h2" class="led heat"></div></div>
             </div>
-            <p>Stage: <b id="stage" style="color:#03dac6">IDLE</b></p>
+            <p style="margin: 10px 0 0 0;">Stage: <b id="stage" style="color:#03dac6">IDLE</b></p>
         </div>
 
-        <div class="card" style="margin-top:20px">
-            <h2>Config & Physics</h2>
+        <div class="card">
+            <h2>Heat Flux Equalizer</h2>
             <div class="input-row"><label>Mass Flow (L/min)</label><input type="number" id="c_flow" value="1.0" step="0.1" onchange="cfg()"></div>
-            <div class="input-row"><label>Heater Power (W)</label><input type="number" id="c_pow" value="3000" step="100" onchange="cfg()"></div>
+            <div class="input-row"><label>Global Limit (W)</label><input type="number" id="c_pow" value="1000" step="100" onchange="cfg()"></div>
             <div class="input-row"><label>Power Calc:</label><span id="calc_w" style="color:#03dac6">0 W</span></div>
-            <div class="input-row"><label>Duty Cycle:</label><span id="calc_d" style="color:#03dac6">0 %</span></div>
+            
+            <div class="eq-grid" style="color:#bbb; border-bottom:1px solid #333; padding-bottom:5px; margin-top:10px;">
+                <div>ZONE</div><div>FLUX BIAS</div><div>POWER / DUTY</div>
+            </div>
+            <div class="eq-grid">
+                <div>INLET (H1)</div>
+                <div><input type="range" min="0" max="10" value="10" id="eq_1" onchange="cfg()" oninput="document.getElementById('ev1').innerText=this.value"> <span id="ev1">10</span></div>
+                <div><span id="z1_p" class="val-display">0</span>W / <span id="z1_d" class="val-display">0</span>%</div>
+            </div>
+            <div class="eq-grid">
+                <div>CENTER (H2)</div>
+                <div><input type="range" min="0" max="10" value="10" id="eq_2" onchange="cfg()" oninput="document.getElementById('ev2').innerText=this.value"> <span id="ev2">10</span></div>
+                <div><span id="z2_p" class="val-display">0</span>W / <span id="z2_d" class="val-display">0</span>%</div>
+            </div>
+            <div class="eq-grid">
+                <div>OUTLET (H3)</div>
+                <div><input type="range" min="0" max="10" value="10" id="eq_3" onchange="cfg()" oninput="document.getElementById('ev3').innerText=this.value"> <span id="ev3">10</span></div>
+                <div><span id="z3_p" class="val-display">0</span>W / <span id="z3_d" class="val-display">0</span>%</div>
+            </div>
         </div>
 
-        <div class="card" style="margin-top:20px">
-            <h2>Logic Settings</h2>
-            <div class="input-row"><label>Tank Target (°C)</label><input type="number" id="c_tt" value="65" onchange="cfg()"></div>
-            <div class="input-row"><label>Max Delta T (°C)</label><input type="number" id="c_dt" value="2" onchange="cfg()"></div>
-            <div class="input-row"><label>Target Warm (°C)</label><input type="number" id="c_tw" value="40" onchange="cfg()"></div>
-            <div class="input-row"><label>Target Hot (°C)</label><input type="number" id="c_th" value="90" onchange="cfg()"></div>
+        <div class="card">
+            <h2>Logic & Timers</h2>
+            <div class="input-row" style="width:48%; display:inline-flex;"><label>Tk Target</label><input type="number" id="c_tt" value="65" onchange="cfg()"></div>
+            <div class="input-row" style="width:48%; display:inline-flex; float:right;"><label>Max dTk</label><input type="number" id="c_dt" value="2" onchange="cfg()"></div>
+            <div class="input-row" style="width:48%; display:inline-flex;"><label>Warm °C</label><input type="number" id="c_tw" value="40" onchange="cfg()"></div>
+            <div class="input-row" style="width:48%; display:inline-flex; float:right;"><label>Hot °C</label><input type="number" id="c_th" value="90" onchange="cfg()"></div>
+            <div class="input-row" style="width:48%; display:inline-flex;"><label>Pre (s)</label><input type="number" id="c_pre" value="5" onchange="cfg()"></div>
+            <div class="input-row" style="width:48%; display:inline-flex; float:right;"><label>Post (s)</label><input type="number" id="c_pos" value="5" onchange="cfg()"></div>
         </div>
     </div>
 </div>
@@ -491,48 +626,51 @@ void RunWebServer() {
         document.getElementById('simControls').style.opacity = s ? "1" : "0.3";
         fetch('/cmd?sim=' + (s?1:0));
     }
-
     function toggleRelay() {
         let s = document.getElementById('relayToggle').checked;
         document.getElementById('relayLabel').innerHTML = "OUTPUT: <b>" + (s ? "SIMULATED" : "LIVE RELAYS") + "</b>";
-        // Visual indicator that relays are dangerous/live
         document.getElementById('relayLabel').style.color = s ? "#fff" : "#ff4444"; 
         fetch('/cmd?relaySim=' + (s?1:0));
     }
-    
     function cfg() {
         let qs = `tt=${document.getElementById('c_tt').value}&dt=${document.getElementById('c_dt').value}` +
                  `&tw=${document.getElementById('c_tw').value}&th=${document.getElementById('c_th').value}` +
-                 `&fl=${document.getElementById('c_flow').value}&pw=${document.getElementById('c_pow').value}`;
+                 `&fl=${document.getElementById('c_flow').value}&pw=${document.getElementById('c_pow').value}` +
+                 `&pre=${document.getElementById('c_pre').value}&pos=${document.getElementById('c_pos').value}` +
+                 `&e1=${document.getElementById('eq_1').value}&e2=${document.getElementById('eq_2').value}&e3=${document.getElementById('eq_3').value}`;
         fetch('/config?'+qs);
     }
 
     setInterval(()=>{
         fetch('/status').then(r=>r.json()).then(d=>{
-            // LEDs
+            // Relays
             for(let i=1;i<=6;i++) document.getElementById('l'+i).className='led '+(d.ev[i]?'on':'');
             document.getElementById('lp').className='led '+(d.pump?'on':'');
-            document.getElementById('lh').className='led heat '+(d.heat?'on':'');
+            for(let i=0;i<3;i++) document.getElementById('h'+i).className='led heat '+(d.h[i]?'on':'');
             
-            // Text
-            document.getElementById('status').innerText = d.msg;
+            // Text & Status 
+            document.getElementById('status').innerHTML = d.msg.replace('|', '<br>');
             document.getElementById('stage').innerText = d.stage;
-            document.getElementById('calc_w').innerText = d.power.toFixed(0) + " W";
-            document.getElementById('calc_d').innerText = (d.duty*100).toFixed(0) + " %";
             
-            // Real Sensors + Disconnect Logic
+            // Physics limits warning
+            if (d.pEx) {
+                document.getElementById('calc_w').innerHTML = "<span class='warning'>" + d.rawW.toFixed(0) + "W (Need)</span> / " + d.totW.toFixed(0) + "W (Limit)";
+            } else {
+                document.getElementById('calc_w').innerHTML = "<span style='color:#03dac6'>" + d.totW.toFixed(0) + "W</span>";
+            }
+
+            for(let i=0;i<3;i++) {
+                document.getElementById('z'+(i+1)+'_p').innerText = d.zW[i].toFixed(0);
+                document.getElementById('z'+(i+1)+'_d').innerText = (d.zD[i]*100).toFixed(0);
+            }
+            
+            // Live Sensors
             for(let i=0; i<6; i++) {
                 let val = d.real[i];
                 let elBox = document.getElementById('box'+i);
                 let elText = document.getElementById('r'+i);
-                
-                if(val <= -900) {
-                    elText.innerText = "NC";
-                    elBox.className = "live-box disconnected";
-                } else {
-                    elText.innerText = val.toFixed(1);
-                    elBox.className = "live-box";
-                }
+                if(val <= -900) { elText.innerText = "NC"; elBox.className = "live-box disconnected"; } 
+                else { elText.innerText = val.toFixed(1); elBox.className = "live-box"; }
             }
         });
     }, 500);
@@ -545,12 +683,17 @@ void RunWebServer() {
 
     svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
         stringstream ss;
+        // EXPLICIT LOAD() for JSON output
         ss << "{ \"ev\":[0," << SYS.ev[1] << "," << SYS.ev[2] << "," << SYS.ev[3] << "," 
            << SYS.ev[4] << "," << SYS.ev[5] << "," << SYS.ev[6] << "], \"pump\":" << SYS.pump 
-           << ", \"heat\":" << SYS.heater << ", \"duty\":" << SYS.heaterDutyCycle
-           << ", \"power\":" << SYS.calculatedPower
+           << ", \"h\":[" << SYS.h[0] << "," << SYS.h[1] << "," << SYS.h[2] << "]"
+           << ", \"totW\":" << SYS.totalCalculatedPower.load()
+           << ", \"rawW\":" << SYS.rawRequiredPower.load()
+           << ", \"pEx\":" << (SYS.powerExceeded.load() ? "true" : "false")
+           << ", \"zW\":[" << SYS.zonePower[0].load() << "," << SYS.zonePower[1].load() << "," << SYS.zonePower[2].load() << "]"
+           << ", \"zD\":[" << SYS.activeDuty[0].load() << "," << SYS.activeDuty[1].load() << "," << SYS.activeDuty[2].load() << "]"
            << ", \"real\":[";
-        for(int i=0;i<6;i++) ss << SYS.realSensors[i] << (i<5?",":"");
+        for(int i=0;i<6;i++) ss << SYS.realSensors[i].load() << (i<5?",":"");
         ss << "]";
         { lock_guard<mutex> l(SYS.stateMutex); 
           ss << ", \"msg\":\"" << SYS.statusMessage << "\", \"stage\":\"" << SYS.currentStage << "\""; }
@@ -561,8 +704,7 @@ void RunWebServer() {
     svr.Get("/cmd", [](const httplib::Request& req, httplib::Response& res) {
         if(req.has_param("mode")) {
             lock_guard<mutex> l(SYS.stateMutex);
-            SYS.currentMode = req.get_param_value("mode");
-            SYS.currentStage = "AUTO"; 
+            SYS.targetMode = req.get_param_value("mode");
         }
         if(req.has_param("pour")) SYS.isPouring = (req.get_param_value("pour") == "1");
         if(req.has_param("sim")) SYS.useSensorSimulation = (req.get_param_value("sim") == "1");
@@ -572,9 +714,9 @@ void RunWebServer() {
 
     svr.Get("/sensor", [](const httplib::Request& req, httplib::Response& res) {
         string id = req.get_param_value("id"); double v = stod(req.get_param_value("val"));
-        if(id=="t1") SYS.simSensors[0]=v; 
-        if(id=="t2") SYS.simSensors[1]=v; 
-        if(id=="t3") SYS.simSensors[2]=v;
+        if(id=="t1") SYS.simSensors[0] = v; 
+        if(id=="t2") SYS.simSensors[1] = v; 
+        if(id=="t3") SYS.simSensors[2] = v;
         res.set_content("OK", "text/plain");
     });
 
@@ -585,7 +727,12 @@ void RunWebServer() {
             if(req.has_param("tw")) SYS.targetWarm = stod(req.get_param_value("tw"));
             if(req.has_param("th")) SYS.targetHot = stod(req.get_param_value("th"));
             if(req.has_param("fl")) SYS.massFlowRateL_min = stod(req.get_param_value("fl"));
-            if(req.has_param("pw")) SYS.heaterMaxPowerW = stod(req.get_param_value("pw"));
+            if(req.has_param("pw")) SYS.heaterMaxLimitW = stod(req.get_param_value("pw"));
+            if(req.has_param("pre")) SYS.preTimeSec = stoi(req.get_param_value("pre"));
+            if(req.has_param("pos")) SYS.postTimeSec = stoi(req.get_param_value("pos"));
+            if(req.has_param("e1")) SYS.eqInlet = stod(req.get_param_value("e1"));
+            if(req.has_param("e2")) SYS.eqCenter = stod(req.get_param_value("e2"));
+            if(req.has_param("e3")) SYS.eqOutlet = stod(req.get_param_value("e3"));
         } catch(...) {}
         res.set_content("OK", "text/plain");
     });
@@ -594,20 +741,18 @@ void RunWebServer() {
     svr.listen("0.0.0.0", 8090);
 }
 
-// --- 7. MAIN ENTRY POINT ---
+// --- 8. MAIN ENTRY POINT ---
 int main() {
     SerialPort p("COM9");
     RelayController r(&p);
     SensorManager s;
     
-    // Initialize Sim Defaults
-    SYS.simSensors[0] = 20.0; 
-    SYS.simSensors[1] = 25.0; 
-    SYS.simSensors[2] = 55.0; 
-    SYS.simSensors[3] = 25.0;
+    SYS.simSensors[0] = 20.0; SYS.simSensors[1] = 25.0; 
+    SYS.simSensors[2] = 55.0; SYS.simSensors[3] = 25.0;
 
-    thread t(ControlLoop, &r, &s);
-    t.detach();
+    thread logger(InfluxLoggerThread); logger.detach();
+    thread t(ControlLoop, &r, &s); t.detach();
+    
     RunWebServer();
     return 0;
 }
