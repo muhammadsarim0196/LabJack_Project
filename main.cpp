@@ -1,8 +1,9 @@
 /**
- * SMART HYDRAULIC CONTROL SYSTEM (.LOAD() COMPILER FIX)
+ * SMART HYDRAULIC CONTROL SYSTEM (ROBUST FLOW ON FIO2)
  * -----------------------------------------------------
  * - Fixed std::atomic assignment deleted function errors
  * - Explicit .load() calls for thread-safe value extraction
+ * - Added Flow Meter on FIO2 (Separated Read Cycle for Stability)
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -27,6 +28,7 @@ using namespace std;
 const double WATER_CP = 4186.0; 
 const double MAX_POWER_PER_ZONE = 400.0; // 2x200W elements per zone
 const long   HEATER_STAGGER_MS = 500;    // Delay between zone activations
+const double FLOW_CALIBRATION = 760.0;   // Pulses per Liter
 
 // --- INFLUXDB CONFIGURATION ---
 const char* INFLUX_HOST = "localhost";
@@ -45,6 +47,7 @@ struct SystemState {
 
     // Raw Real Sensor Data
     atomic<double> realSensors[6]; 
+    atomic<double> liveFlowRate{0.0}; // <-- NEW
 
     // Toggles
     atomic<double> simSensors[4]; 
@@ -80,9 +83,9 @@ struct SystemState {
     string statusMessage = "Initializing...";
 
     // Relays
-    bool ev[7] = {0}; 
+    bool ev[7] = {false}; 
     bool pump = false;
-    bool h[3] = {0}; 
+    bool h[3] = {false}; 
 
     // Flags
     atomic<bool> isPouring{false}; 
@@ -117,12 +120,17 @@ public:
 class SensorManager {
     int handle = 0;
     bool connected = false;
-    const char* readNames[6] = {
+    
+    const char* readNamesTC[6] = {
         "AIN48_EF_READ_A", "AIN49_EF_READ_A", "AIN50_EF_READ_A",
         "AIN51_EF_READ_A", "AIN52_EF_READ_A", "AIN53_EF_READ_A"
     };
-    double readValues[6] = {0};
+    double readValuesTC[6] = {0};
     int errAddress = -1;
+
+    // Flow Meter Tracking
+    uint32_t lastPulseCount = 0;
+    chrono::steady_clock::time_point lastFlowRead;
 
 public:
     SensorManager() {
@@ -147,18 +155,46 @@ public:
              1,  1,  1,  1,  1,  1    
         };
         LJM_eWriteNames(handle, NUM_FRAMES, configNames, configValues, &errAddress);
+
+        // --- NEW: FIO2 Flow Meter Configuration ---
+        LJM_eWriteName(handle, "DIO2_EF_ENABLE", 0); 
+        LJM_eWriteName(handle, "DIO2_EF_INDEX", 8);  // 7 = High Speed Counter
+        LJM_eWriteName(handle, "DIO2_EF_ENABLE", 1); 
+        lastFlowRead = chrono::steady_clock::now();
     }
 
     void read() {
         if(!connected) return;
-        int err = LJM_eReadNames(handle, 6, readNames, readValues, &errAddress);
-        if(err == 0) {
+        
+        // 1. Read Thermocouples (Separated to prevent Modbus aborts)
+        int errTC = LJM_eReadNames(handle, 6, readNamesTC, readValuesTC, &errAddress);
+        if(errTC == 0) {
             for(int i=0; i<6; i++) {
-                if(readValues[i] > -5.0 && readValues[i] < 110.0) {
-                    SYS.realSensors[i] = readValues[i];
+                if(readValuesTC[i] > -5.0 && readValuesTC[i] < 110.0) {
+                    SYS.realSensors[i] = readValuesTC[i];
                 } else {
                     SYS.realSensors[i] = -999.0; // NC Filter
                 }
+            }
+        }
+
+        // 2. Read Flow Meter (FIO2)
+        double flowCountRaw = 0;
+        int errFlow = LJM_eReadName(handle, "DIO2_EF_READ_A", &flowCountRaw);
+        if(errFlow == 0) {
+            uint32_t currentPulses = (uint32_t)flowCountRaw;
+            auto now = chrono::steady_clock::now();
+            double duration = chrono::duration<double>(now - lastFlowRead).count();
+            
+            if (duration >= 0.5) { // Update every 500ms
+                double deltaPulses = (double)(currentPulses - lastPulseCount);
+                if (deltaPulses < 0) deltaPulses = 0; // Prevent reset spikes
+                
+                double l_min = ((deltaPulses / FLOW_CALIBRATION) / duration) * 60.0;
+                SYS.liveFlowRate = (l_min < 0.05) ? 0.0 : l_min;
+
+                lastPulseCount = currentPulses;
+                lastFlowRead = now;
             }
         }
     }
@@ -195,17 +231,13 @@ public:
         }
 
         bool useSim = SYS.useRelaySimulation.load();
-        bool desired[12] = {false};
-        desired[1] = useSim ? false : ev1;
-        desired[2] = useSim ? false : ev2;
-        desired[3] = useSim ? false : ev3;
-        desired[4] = useSim ? false : ev4;
-        desired[5] = useSim ? false : ev5;
-        desired[6] = useSim ? false : ev6;
-        desired[7] = useSim ? false : pump;
-        desired[9] = useSim ? false : h1; 
-        desired[10]= useSim ? false : h2; 
-        desired[11]= useSim ? false : h3; 
+        bool desired[12] = {
+            false, 
+            useSim ? false : ev1, useSim ? false : ev2, useSim ? false : ev3, 
+            useSim ? false : ev4, useSim ? false : ev5, useSim ? false : ev6, 
+            useSim ? false : pump, false, 
+            useSim ? false : h1, useSim ? false : h2, useSim ? false : h3
+        };
 
         for (int i = 1; i <= 11; i++) {
             if (i == 8) continue; 
@@ -233,7 +265,6 @@ void InfluxLoggerThread() {
     while (true) {
         this_thread::sleep_for(chrono::seconds(1)); 
         
-        // EXPLICIT LOAD() for all atomics
         double t1 = SYS.t1.load(), t2 = SYS.t2.load(), t3 = SYS.t3.load(), t4 = SYS.t4.load();
         double p1 = SYS.zonePower[0].load(), p2 = SYS.zonePower[1].load(), p3 = SYS.zonePower[2].load();
         
@@ -257,7 +288,6 @@ void CalculatePhysics() {
     string mode; { lock_guard<mutex> l(SYS.stateMutex); mode = SYS.currentMode; }
     
     if (mode == "WARM" || mode == "HOT") {
-        // EXPLICIT LOAD() for all atomics
         double flow_kg_s = (SYS.massFlowRateL_min.load() / 60.0);
         double deltaT = 0.0;
 
@@ -307,7 +337,6 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
         this_thread::sleep_for(chrono::milliseconds(100));
         sensors->read();
 
-        // EXPLICIT LOAD() for all mappings
         if (SYS.useSensorSimulation.load()) {
             SYS.t1 = SYS.simSensors[0].load(); 
             SYS.t2 = SYS.simSensors[1].load();
@@ -329,14 +358,12 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
             targetMode = SYS.targetMode;
         }
         
-        // EXPLICIT LOAD() to avoid compiler confusion
         t2 = SYS.t2.load(); 
         t3 = SYS.t3.load();
         tankTarget = SYS.tankTargetTemp.load();
         tankDeltaLimit = SYS.tankMaxDelta.load();
         pouring = SYS.isPouring.load();
 
-        // --- SAFE TRANSITION LOGIC ---
         if (mode != targetMode) {
             if (SYS.currentStage == "IDLE" || SYS.currentStage == "READY") {
                 lock_guard<mutex> l(SYS.stateMutex);
@@ -355,8 +382,7 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
         CalculatePhysics();
         string warningText = SYS.powerExceeded.load() ? " | LIMIT EXCEEDED" : "";
 
-        // --- STATE MACHINE ---
-        bool r_ev[7] = {0}; bool r_pump = 0; 
+        bool r_ev[7] = {false}; bool r_pump = false; 
         bool stageWantsHeat = false;
 
         if (mode == "WARM" || mode == "HOT") {
@@ -392,12 +418,12 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
                 } else {
                     r_pump = true; stageWantsHeat = true;
                     SYS.statusMessage = "Dispensing..." + warningText;
-                    if(mode=="WARM") { r_ev[2]=1; r_ev[6]=1; }
-                    if(mode=="HOT")  { r_ev[1]=1; r_ev[4]=1; r_ev[6]=1; }
+                    if(mode=="WARM") { r_ev[2]=true; r_ev[6]=true; }
+                    if(mode=="HOT")  { r_ev[1]=true; r_ev[4]=true; r_ev[6]=true; }
                 }
             }
             else if (SYS.currentStage == "POST") {
-                r_pump = true; r_ev[3]=1; r_ev[5]=1; 
+                r_pump = true; r_ev[3]=true; r_ev[5]=true; 
                 auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - stateTimer).count();
                 long rem = SYS.postTimeSec.load() - elapsed;
                 if (rem <= 0) {
@@ -422,12 +448,12 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
                     SYS.currentStage = "POST";
                     stateTimer = chrono::steady_clock::now();
                 } else {
-                    r_ev[3] = 1; r_ev[5] = 1; r_pump = 1; stageWantsHeat = true;
+                    r_ev[3] = true; r_ev[5] = true; r_pump = true; stageWantsHeat = true;
                     SYS.statusMessage = "Recirculating...";
                 }
             }
             else if (SYS.currentStage == "POST") {
-                r_ev[3] = 1; r_ev[5] = 1; r_pump = 1; 
+                r_ev[3] = true; r_ev[5] = true; r_pump = true; 
                 auto elapsed = chrono::duration_cast<chrono::seconds>(chrono::steady_clock::now() - stateTimer).count();
                 long rem = SYS.postTimeSec.load() - elapsed;
                 if (rem <= 0) SYS.currentStage = "IDLE";
@@ -435,7 +461,6 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
             }
         }
 
-        // --- STAGGERED HEATER LOGIC ---
         static bool lastHeatingEnabled = false;
         static auto heatChangeTime = chrono::steady_clock::now();
 
@@ -542,6 +567,11 @@ void RunWebServer() {
                 <div class="live-box" id="box3">T3(Out)<br><span id="r3">--</span>°C</div>
                 <div class="live-box" id="box4">T4(Aux)<br><span id="r4">--</span>°C</div>
                 <div class="live-box" id="box5">T5(Aux)<br><span id="r5">--</span>°C</div>
+                
+                <div class="live-box" id="flowBox" style="grid-column: span 3; border-color: #03dac6; margin-top: 5px;">
+                    ACTUAL FLOW RATE<br>
+                    <span id="flowVal" style="font-size: 20px; font-weight: bold;">0.00</span> L/min
+                </div>
             </div>
             <br>
             <div class="toggle-container">
@@ -672,6 +702,9 @@ void RunWebServer() {
                 if(val <= -900) { elText.innerText = "NC"; elBox.className = "live-box disconnected"; } 
                 else { elText.innerText = val.toFixed(1); elBox.className = "live-box"; }
             }
+
+            // Flow Rate UI
+            document.getElementById('flowVal').innerText = d.flow.toFixed(2);
         });
     }, 500);
 </script>
@@ -683,7 +716,6 @@ void RunWebServer() {
 
     svr.Get("/status", [](const httplib::Request&, httplib::Response& res) {
         stringstream ss;
-        // EXPLICIT LOAD() for JSON output
         ss << "{ \"ev\":[0," << SYS.ev[1] << "," << SYS.ev[2] << "," << SYS.ev[3] << "," 
            << SYS.ev[4] << "," << SYS.ev[5] << "," << SYS.ev[6] << "], \"pump\":" << SYS.pump 
            << ", \"h\":[" << SYS.h[0] << "," << SYS.h[1] << "," << SYS.h[2] << "]"
@@ -692,6 +724,7 @@ void RunWebServer() {
            << ", \"pEx\":" << (SYS.powerExceeded.load() ? "true" : "false")
            << ", \"zW\":[" << SYS.zonePower[0].load() << "," << SYS.zonePower[1].load() << "," << SYS.zonePower[2].load() << "]"
            << ", \"zD\":[" << SYS.activeDuty[0].load() << "," << SYS.activeDuty[1].load() << "," << SYS.activeDuty[2].load() << "]"
+           << ", \"flow\":" << SYS.liveFlowRate.load() 
            << ", \"real\":[";
         for(int i=0;i<6;i++) ss << SYS.realSensors[i].load() << (i<5?",":"");
         ss << "]";
