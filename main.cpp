@@ -26,7 +26,10 @@ using namespace std;
 
 // --- CONFIGURATION CONSTANTS ---
 const double WATER_CP = 4186.0; 
-const double MAX_POWER_PER_ZONE = 400.0; // 2x200W elements per zone
+const double MAX_POWER_PER_ZONE_1 = 605.0; // 1x80ohm element for zone1
+const double MAX_POWER_PER_ZONE_2 = 302.0; // (2x80ohm in series) elements for zone2
+const double MAX_POWER_PER_ZONE_3 = 201.0; // (3x80ohm in series) elements for zone3
+const double MAX_POWER = MAX_POWER_PER_ZONE_1 + MAX_POWER_PER_ZONE_2 + MAX_POWER_PER_ZONE_3;
 const long   HEATER_STAGGER_MS = 500;    // Delay between zone activations
 const double FLOW_CALIBRATION = 760.0;   // Pulses per Liter
 
@@ -170,7 +173,7 @@ public:
         int errTC = LJM_eReadNames(handle, 6, readNamesTC, readValuesTC, &errAddress);
         if(errTC == 0) {
             for(int i=0; i<6; i++) {
-                if(readValuesTC[i] > -5.0 && readValuesTC[i] < 110.0) {
+                if(readValuesTC[i] > -5.0 && readValuesTC[i] < 120.0) {
                     SYS.realSensors[i] = readValuesTC[i];
                 } else {
                     SYS.realSensors[i] = -999.0; // NC Filter
@@ -310,20 +313,20 @@ void CalculatePhysics() {
         double p2 = activePower * (r2 / totalRatio);
         double p3 = activePower * (r3 / totalRatio);
 
-        double d1 = p1 / MAX_POWER_PER_ZONE; if(d1 > 1.0) d1 = 1.0;
-        double d2 = p2 / MAX_POWER_PER_ZONE; if(d2 > 1.0) d2 = 1.0;
-        double d3 = p3 / MAX_POWER_PER_ZONE; if(d3 > 1.0) d3 = 1.0;
+        double d1 = p1 / MAX_POWER_PER_ZONE_1; if(d1 > 1.0) d1 = 1.0;
+        double d2 = p2 / MAX_POWER_PER_ZONE_2; if(d2 > 1.0) d2 = 1.0;
+        double d3 = p3 / MAX_POWER_PER_ZONE_3; if(d3 > 1.0) d3 = 1.0;
 
-        SYS.zoneDuty[0] = d1; SYS.zonePower[0] = d1 * MAX_POWER_PER_ZONE;
-        SYS.zoneDuty[1] = d2; SYS.zonePower[1] = d2 * MAX_POWER_PER_ZONE;
-        SYS.zoneDuty[2] = d3; SYS.zonePower[2] = d3 * MAX_POWER_PER_ZONE;
+        SYS.zoneDuty[0] = d1; SYS.zonePower[0] = d1 * MAX_POWER_PER_ZONE_1;
+        SYS.zoneDuty[1] = d2; SYS.zonePower[1] = d2 * MAX_POWER_PER_ZONE_2;
+        SYS.zoneDuty[2] = d3; SYS.zonePower[2] = d3 * MAX_POWER_PER_ZONE_3;
         SYS.totalCalculatedPower = SYS.zonePower[0].load() + SYS.zonePower[1].load() + SYS.zonePower[2].load();
         
     } else {
         SYS.totalCalculatedPower = 0;
         SYS.rawRequiredPower = 0;
         SYS.powerExceeded = false;
-        for(int i=0; i<3; i++) { SYS.zonePower[i] = MAX_POWER_PER_ZONE; SYS.zoneDuty[i] = 1.0; }
+        for(int i=0; i<3; i++) { SYS.zonePower[i] = MAX_POWER; SYS.zoneDuty[i] = 1.0; }
     }
 }
 
