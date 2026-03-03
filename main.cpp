@@ -31,7 +31,7 @@ const double MAX_POWER_PER_ZONE_2 = 302.0; // (2x80ohm in series) elements for z
 const double MAX_POWER_PER_ZONE_3 = 201.0; // (3x80ohm in series) elements for zone3
 const double MAX_POWER = MAX_POWER_PER_ZONE_1 + MAX_POWER_PER_ZONE_2 + MAX_POWER_PER_ZONE_3;
 const long   HEATER_STAGGER_MS = 500;    // Delay between zone activations
-const double FLOW_CALIBRATION = 760.0;   // Pulses per Liter
+const double FLOW_CALIBRATION = 260.0;   // Pulses per Liter
 
 // --- INFLUXDB CONFIGURATION ---
 const char* INFLUX_HOST = "localhost";
@@ -61,7 +61,7 @@ struct SystemState {
     atomic<double> targetWarm{40.0};
     atomic<double> targetHot{90.0};
     atomic<double> massFlowRateL_min{1.0};
-    atomic<double> heaterMaxLimitW{1000.0}; 
+    atomic<double> heaterMaxLimitW{1108.0}; 
     atomic<int>    preTimeSec{5};           
     atomic<int>    postTimeSec{5};          
     atomic<double> tankTargetTemp{65.0}; 
@@ -92,6 +92,7 @@ struct SystemState {
 
     // Flags
     atomic<bool> isPouring{false}; 
+    atomic<bool> continuousPourMode{false};
     mutex stateMutex;
 };
 
@@ -558,7 +559,11 @@ void RunWebServer() {
                 <button class="btn-hot" onclick="setMode('HOT')">HOT MODE</button>
                 <button class="btn-auto" onclick="setMode('AUTO')">AUTO / CANCEL</button>
             </div>
-            <button id="pourBtn" onmousedown="pour(1)" onmouseup="pour(0)" ontouchstart="pour(1)" ontouchend="pour(0)">HOLD TO POUR</button>
+            <div class="toggle-container" style="margin-top: 10px;">
+                <span id="pourModeLabel">POUR MODE: <b>HOLD</b></span>
+                <label class="switch"><input type="checkbox" id="continuousToggle" onchange="toggleContinuousPourMode()"><span class="slider"></span></label>
+            </div>
+            <button id="pourBtn" onmousedown="onPourStart(event)" onmouseup="onPourStop(event)" onmouseleave="onPourStop(event)" ontouchstart="onPourStart(event)" ontouchend="onPourStop(event)" onclick="onPourClick(event)">HOLD TO POUR</button>
         </div>
 
         <div class="card">
@@ -614,7 +619,7 @@ void RunWebServer() {
         <div class="card">
             <h2>Heat Flux Equalizer</h2>
             <div class="input-row"><label>Mass Flow (L/min)</label><input type="number" id="c_flow" value="1.0" step="0.1" onchange="cfg()"></div>
-            <div class="input-row"><label>Global Limit (W)</label><input type="number" id="c_pow" value="1000" step="100" onchange="cfg()"></div>
+            <div class="input-row"><label>Global Limit (W)</label><input type="number" id="c_pow" value="1980" step="100" onchange="cfg()"></div>
             <div class="input-row"><label>Power Calc:</label><span id="calc_w" style="color:#03dac6">0 W</span></div>
             
             <div class="eq-grid" style="color:#bbb; border-bottom:1px solid #333; padding-bottom:5px; margin-top:10px;">
@@ -651,6 +656,38 @@ void RunWebServer() {
 <script>
     function setMode(m) { fetch('/cmd?mode='+m); }
     function pour(v) { fetch('/cmd?pour='+v); }
+    let continuousMode = false;
+    let continuousPourActive = false;
+
+    function refreshPourUi() {
+        document.getElementById('pourModeLabel').innerHTML = "POUR MODE: <b>" + (continuousMode ? "CONTINUOUS" : "HOLD") + "</b>";
+        document.getElementById('pourBtn').innerText = continuousMode
+            ? (continuousPourActive ? "STOP POUR" : "START CONTINUOUS POUR")
+            : "HOLD TO POUR";
+    }
+    function toggleContinuousPourMode() {
+        continuousMode = document.getElementById('continuousToggle').checked;
+        if (!continuousMode && continuousPourActive) {
+            continuousPourActive = false;
+            pour(0);
+        }
+        fetch('/cmd?continuous=' + (continuousMode ? 1 : 0));
+        refreshPourUi();
+    }
+    function onPourStart() {
+        if (continuousMode) return;
+        pour(1);
+    }
+    function onPourStop() {
+        if (continuousMode) return;
+        pour(0);
+    }
+    function onPourClick() {
+        if (!continuousMode) return;
+        continuousPourActive = !continuousPourActive;
+        pour(continuousPourActive ? 1 : 0);
+        refreshPourUi();
+    }
     function setSens(id, v) { document.getElementById('v_'+id).innerText=v; fetch('/sensor?id='+id+'&val='+v); }
     
     function toggleSim() { 
@@ -676,6 +713,11 @@ void RunWebServer() {
 
     setInterval(()=>{
         fetch('/status').then(r=>r.json()).then(d=>{
+            continuousMode = !!d.cPour;
+            continuousPourActive = !!d.pouring;
+            document.getElementById('continuousToggle').checked = continuousMode;
+            refreshPourUi();
+
             // Relays
             for(let i=1;i<=6;i++) document.getElementById('l'+i).className='led '+(d.ev[i]?'on':'');
             document.getElementById('lp').className='led '+(d.pump?'on':'');
@@ -710,6 +752,7 @@ void RunWebServer() {
             document.getElementById('flowVal').innerText = d.flow.toFixed(2);
         });
     }, 500);
+    refreshPourUi();
 </script>
 </body>
 </html>
@@ -727,7 +770,9 @@ void RunWebServer() {
            << ", \"pEx\":" << (SYS.powerExceeded.load() ? "true" : "false")
            << ", \"zW\":[" << SYS.zonePower[0].load() << "," << SYS.zonePower[1].load() << "," << SYS.zonePower[2].load() << "]"
            << ", \"zD\":[" << SYS.activeDuty[0].load() << "," << SYS.activeDuty[1].load() << "," << SYS.activeDuty[2].load() << "]"
-           << ", \"flow\":" << SYS.liveFlowRate.load() 
+           << ", \"flow\":" << SYS.liveFlowRate.load()
+           << ", \"pouring\":" << (SYS.isPouring.load() ? "true" : "false")
+           << ", \"cPour\":" << (SYS.continuousPourMode.load() ? "true" : "false")
            << ", \"real\":[";
         for(int i=0;i<6;i++) ss << SYS.realSensors[i].load() << (i<5?",":"");
         ss << "]";
@@ -743,6 +788,11 @@ void RunWebServer() {
             SYS.targetMode = req.get_param_value("mode");
         }
         if(req.has_param("pour")) SYS.isPouring = (req.get_param_value("pour") == "1");
+        if(req.has_param("continuous")) {
+            bool continuous = (req.get_param_value("continuous") == "1");
+            SYS.continuousPourMode = continuous;
+            if (!continuous) SYS.isPouring = false;
+        }
         if(req.has_param("sim")) SYS.useSensorSimulation = (req.get_param_value("sim") == "1");
         if(req.has_param("relaySim")) SYS.useRelaySimulation = (req.get_param_value("relaySim") == "1");
         res.set_content("OK", "text/plain");
