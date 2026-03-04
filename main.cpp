@@ -65,7 +65,9 @@ struct SystemState {
     atomic<int>    preTimeSec{5};           
     atomic<int>    postTimeSec{5};          
     atomic<double> tankTargetTemp{65.0}; 
-    atomic<double> tankMaxDelta{2.0};    
+    atomic<double> tankMaxDelta{2.0};
+    atomic<double> recircUpperDelta{4.0};
+    atomic<double> recircLowerDelta{1.0};
 
     // Heat Flux Equalizer 
     atomic<double> eqInlet{10.0};
@@ -336,6 +338,8 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
     this_thread::sleep_for(chrono::seconds(2));
 
     auto stateTimer = chrono::steady_clock::now();
+    bool autoHeatDemand = false;
+    bool autoHeatInitialized = false;
 
     while (true) {
         this_thread::sleep_for(chrono::milliseconds(100));
@@ -354,7 +358,7 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
         }
 
         string mode, targetMode;
-        double t2, t3, tankTarget, tankDeltaLimit;
+        double t2, t3, tankTarget, tankDeltaLimit, recircUpperDelta, recircLowerDelta;
         bool pouring;
         {
             lock_guard<mutex> l(SYS.stateMutex);
@@ -366,6 +370,8 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
         t3 = SYS.t3.load();
         tankTarget = SYS.tankTargetTemp.load();
         tankDeltaLimit = SYS.tankMaxDelta.load();
+        recircUpperDelta = SYS.recircUpperDelta.load();
+        recircLowerDelta = SYS.recircLowerDelta.load();
         pouring = SYS.isPouring.load();
 
         if (mode != targetMode) {
@@ -439,9 +445,24 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
             }
         }
         else if (mode == "AUTO") {
-            bool needsHeat = (t3 < tankTarget);
+            if (!autoHeatInitialized) {
+                autoHeatDemand = false;
+                autoHeatInitialized = true;
+            }
+
+            if (recircUpperDelta < 0.0) recircUpperDelta = 0.0;
+            if (recircLowerDelta < 0.0) recircLowerDelta = 0.0;
+
+            // UI label "T2 (TkHi)" maps to internal t3 variable.
+            double tankHighTemp = t3;
+            double startHeatAt = tankTarget - recircLowerDelta;
+            double stopHeatAt = tankTarget + recircUpperDelta;
+
+            if (tankHighTemp >= stopHeatAt) autoHeatDemand = false;
+            else if (tankHighTemp <= startHeatAt) autoHeatDemand = true;
+
             bool stratified = (abs(t3 - t2) > tankDeltaLimit);
-            bool conditionsMet = (needsHeat || stratified);
+            bool conditionsMet = (autoHeatDemand || stratified);
 
             if (SYS.currentStage == "IDLE") {
                 SYS.statusMessage = "System Idle (Temp OK)";
@@ -463,6 +484,8 @@ void ControlLoop(RelayController* relays, SensorManager* sensors) {
                 if (rem <= 0) SYS.currentStage = "IDLE";
                 else SYS.statusMessage = "Recirc Done. Cooling... " + to_string(rem) + "s";
             }
+        } else {
+            autoHeatInitialized = false;
         }
 
         static bool lastHeatingEnabled = false;
@@ -646,6 +669,8 @@ void RunWebServer() {
             <h2>Logic & Timers</h2>
             <div class="input-row" style="width:48%; display:inline-flex;"><label>Tk Target</label><input type="number" id="c_tt" value="65" onchange="cfg()"></div>
             <div class="input-row" style="width:48%; display:inline-flex; float:right;"><label>Max dTk</label><input type="number" id="c_dt" value="2" onchange="cfg()"></div>
+            <div class="input-row" style="width:48%; display:inline-flex;"><label>Upper +C</label><input type="number" id="c_rhi" value="4" step="0.1" onchange="cfg()"></div>
+            <div class="input-row" style="width:48%; display:inline-flex; float:right;"><label>Lower -C</label><input type="number" id="c_rlo" value="1" step="0.1" onchange="cfg()"></div>
             <div class="input-row" style="width:48%; display:inline-flex;"><label>Warm °C</label><input type="number" id="c_tw" value="40" onchange="cfg()"></div>
             <div class="input-row" style="width:48%; display:inline-flex; float:right;"><label>Hot °C</label><input type="number" id="c_th" value="90" onchange="cfg()"></div>
             <div class="input-row" style="width:48%; display:inline-flex;"><label>Pre (s)</label><input type="number" id="c_pre" value="5" onchange="cfg()"></div>
@@ -704,6 +729,7 @@ void RunWebServer() {
     }
     function cfg() {
         let qs = `tt=${document.getElementById('c_tt').value}&dt=${document.getElementById('c_dt').value}` +
+                 `&rhi=${document.getElementById('c_rhi').value}&rlo=${document.getElementById('c_rlo').value}` +
                  `&tw=${document.getElementById('c_tw').value}&th=${document.getElementById('c_th').value}` +
                  `&fl=${document.getElementById('c_flow').value}&pw=${document.getElementById('c_pow').value}` +
                  `&pre=${document.getElementById('c_pre').value}&pos=${document.getElementById('c_pos').value}` +
@@ -810,6 +836,8 @@ void RunWebServer() {
         try {
             if(req.has_param("tt")) SYS.tankTargetTemp = stod(req.get_param_value("tt"));
             if(req.has_param("dt")) SYS.tankMaxDelta = stod(req.get_param_value("dt"));
+            if(req.has_param("rhi")) SYS.recircUpperDelta = stod(req.get_param_value("rhi"));
+            if(req.has_param("rlo")) SYS.recircLowerDelta = stod(req.get_param_value("rlo"));
             if(req.has_param("tw")) SYS.targetWarm = stod(req.get_param_value("tw"));
             if(req.has_param("th")) SYS.targetHot = stod(req.get_param_value("th"));
             if(req.has_param("fl")) SYS.massFlowRateL_min = stod(req.get_param_value("fl"));
